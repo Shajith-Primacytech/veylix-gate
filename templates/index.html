@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Veylix Gate — Blast-Radius Approvals</title>
+  <style>
+    :root { --bg:#0b0d10; --card:#14181d; --ink:#e8ecf1; --mut:#8a94a3; --ok:#39d98a; --warn:#ffb347; --bad:#ff6a6a; --line:#232a33; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:14px/1.55 -apple-system,Segoe UI,Inter,sans-serif; background:var(--bg); color:var(--ink); }
+    header { padding:24px 32px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; }
+    header h1 { margin:0; font-size:18px; letter-spacing:.2px; }
+    .mut { color:var(--mut); }
+    main { padding:24px 32px; display:grid; grid-template-columns: 1fr 1fr; gap:24px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+    .card h2 { margin:0 0 12px; font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--mut); }
+    .stat { display:flex; gap:24px; }
+    .stat div b { display:block; font-size:22px; }
+    form { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+    select, input, textarea, button { font:inherit; background:#0f1419; color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
+    textarea, input[type=text] { flex:1; min-width:260px; }
+    button { cursor:pointer; background:#1f6feb; border-color:#1f6feb; color:white; }
+    button.reject { background:var(--bad); border-color:var(--bad); }
+    button.approve { background:var(--ok); border-color:var(--ok); color:#082015; }
+    .pending-item { border-top:1px solid var(--line); padding:12px 0; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:99px; font-size:11px; font-weight:600; }
+    .badge.safe { background:rgba(57,217,138,.15); color:var(--ok); }
+    .badge.reversible { background:rgba(255,179,71,.15); color:var(--warn); }
+    .badge.destructive { background:rgba(255,106,106,.15); color:var(--bad); }
+    pre { background:#0f1419; border:1px solid var(--line); border-radius:6px; padding:10px; overflow:auto; font-size:12px; margin:8px 0 0; }
+    table { width:100%; border-collapse:collapse; font-size:12px; }
+    th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+    .actions { display:flex; gap:8px; margin-top:8px; }
+    .actions form { margin:0; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🛡️ Veylix Gate <span class="mut">— blast-radius approvals for AI coding agents</span></h1>
+    <span class="mut">one VM · Vultr Serverless Inference · Docker sandbox</span>
+  </header>
+  <main>
+    <section class="card">
+      <h2>Demo database</h2>
+      <div class="stat">
+        <div><b>{{ stats.customers }}</b><span class="mut">customers</span></div>
+        <div><b>{{ stats.orders }}</b><span class="mut">orders</span></div>
+        <div><b>{{ stats.cloud_volumes }}</b><span class="mut">volumes</span></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Try an action</h2>
+      <form method="post" action="/action" onsubmit="return submitJSON(this, 'actionOut')">
+        <select name="kind">
+          <option value="sql">sql</option>
+          <option value="shell">shell</option>
+        </select>
+        <input type="text" name="action" placeholder="e.g. DROP TABLE customers;" required>
+        <button type="submit">Send through gate</button>
+      </form>
+      <pre id="actionOut" class="mut">— no action yet —</pre>
+    </section>
+
+    <section class="card" style="grid-column: 1 / -1;">
+      <h2>Pending approvals ({{ pending|length }})</h2>
+      {% if not pending %}
+        <p class="mut">No destructive actions waiting. Safe and reversible actions run immediately.</p>
+      {% endif %}
+      {% for p in pending %}
+        <div class="pending-item">
+          <span class="badge destructive">{{ p.classification }}</span>
+          <span class="mut">#{{ p.id }} · {{ p.kind }} · {{ p.created_at }}</span>
+          <pre>{{ p.action }}</pre>
+          <pre>{{ p.blast_radius }}</pre>
+          <div class="actions">
+            <form method="post" action="/approve/{{ p.id }}"><button class="approve" type="submit">Approve &amp; run</button></form>
+            <form method="post" action="/reject/{{ p.id }}"><button class="reject" type="submit">Reject</button></form>
+          </div>
+        </div>
+      {% endfor %}
+    </section>
+
+    <section class="card" style="grid-column: 1 / -1;">
+      <h2>Audit log</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Classification</th><th>Decision</th><th>Action</th></tr></thead>
+        <tbody>
+          {% for a in audit %}
+            <tr>
+              <td class="mut">{{ a.ts }}</td>
+              <td><span class="badge {{ a.classification }}">{{ a.classification }}</span></td>
+              <td>{{ a.decision }}</td>
+              <td><code>{{ a.action[:140] }}</code></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+<script>
+async function submitJSON(form, outId){
+  event.preventDefault();
+  const fd = new FormData(form);
+  const r = await fetch(form.action, {method:'POST', body:fd});
+  const j = await r.json();
+  document.getElementById(outId).textContent = JSON.stringify(j, null, 2);
+  setTimeout(()=>location.reload(), 800);
+  return false;
+}
+</script>
+</body>
+</html>

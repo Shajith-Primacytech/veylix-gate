@@ -1,0 +1,13 @@
+services:
+  gate:
+    build: .
+    container_name: veylix-gate
+    ports:
+      - "8000:8000"
+    environment:
+      - VULTR_INFERENCE_API_KEY=${VULTR_INFERENCE_API_KEY:-}
+      - VULTR_INFERENCE_MODEL=${VULTR_INFERENCE_MODEL:-llama-3.3-70b-instruct}
+      - VULTR_INFERENCE_BASE_URL=${VULTR_INFERENCE_BASE_URL:-https://api.vultrinference.com/v1}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
