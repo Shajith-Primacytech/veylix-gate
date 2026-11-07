@@ -1,248 +1,294 @@
-"""Blast-radius gate — classify shell + SQL, dry-run destructive SQL on SQLite."""
+"""Classify one proposal and execute only inside the session's fixtures."""
 import json
+import math
 import re
-import shlex
 import sqlite3
-from dataclasses import dataclass, asdict
+from collections import deque
+from contextlib import closing
+from dataclasses import dataclass, field
+from time import monotonic
 
 import sqlglot
 from sqlglot import exp
 
 import database
 
-SAFE = "safe"
-REVERSIBLE = "reversible"
-DESTRUCTIVE = "destructive"
-
-DESTRUCTIVE_SHELL_PATTERNS = [
-    r"^rm\s+-rf?\b",
-    r"^rm\s+.*-rf\b",
-    r"^dd\b",
-    r"^mkfs",
-    r":\(\)\s*{",
-    r">\s*/dev/sd",
-    r"chmod\s+-R\s+777",
-]
-DESTRUCTIVE_CLI_VERBS = {
-    ("vultr", "volume", "delete"),
-    ("vultr", "instance", "delete"),
-    ("aws", "s3", "rb"),
-    ("aws", "ec2", "terminate-instances"),
-}
-SAFE_SHELL_PREFIXES = {"ls", "cat", "pwd", "whoami", "echo", "git", "head", "tail", "grep", "wc", "find", "env", "printenv"}
+MAX_ACTION = 2048
+READ_FUNCTIONS = frozenset({
+    "abs", "avg", "coalesce", "count", "hex", "ifnull", "instr", "length",
+    "like", "lower", "ltrim", "max", "min", "nullif", "replace", "round", "rtrim",
+    "substr", "sum", "total", "trim", "typeof", "upper",
+})
+SAFE_SHELL = {"ls", "ls -la", "pwd", "whoami", "git status", "git log --oneline"}
 
 
-@dataclass
+@dataclass(frozen=True)
 class Decision:
     classification: str
     reason: str
-    blast_radius: dict
+    sql: str | None = None
+    operation: int | None = None
+    table: str | None = None
+    impact: dict = field(default_factory=dict)
 
 
-def classify_shell(cmd: str) -> Decision:
-    low = cmd.strip()
-    if not low:
-        return Decision(SAFE, "empty command", {})
-    for pat in DESTRUCTIVE_SHELL_PATTERNS:
-        if re.search(pat, low):
-            return Decision(DESTRUCTIVE, f"matches destructive pattern: {pat}", {"command": low})
-    try:
-        tokens = shlex.split(low)
-    except ValueError:
-        return Decision(DESTRUCTIVE, "unparseable shell command", {"command": low})
-    if not tokens:
-        return Decision(SAFE, "empty tokens", {})
-    head3 = tuple(tokens[:3])
-    if head3 in DESTRUCTIVE_CLI_VERBS:
-        br = {"command": low, "target": tokens[3] if len(tokens) > 3 else "unknown"}
-        if tokens[0] == "vultr" and tokens[1] == "volume":
-            br.update(_lookup_volume(tokens[-1]))
-        return Decision(DESTRUCTIVE, "destructive cloud CLI verb", br)
-    if tokens[0] in SAFE_SHELL_PREFIXES:
-        return Decision(SAFE, "read-only shell command", {"command": low})
-    return Decision(REVERSIBLE, "unclassified shell — allowed with snapshot", {"command": low})
+@dataclass
+class Demo:
+    db: sqlite3.Connection = field(default_factory=database.new_database)
+    audit: deque = field(default_factory=lambda: deque(maxlen=100))
+    pending: dict = field(default_factory=dict)
+    next_id: int = 1
+    revision: int = 0
+
+    def log(self, kind: str, action: str, classification: str, decision: str, impact: dict):
+        self.audit.appendleft({
+            "ts": database.timestamp(), "kind": kind, "action": action,
+            "classification": classification, "decision": decision, "blast_radius": impact,
+        })
 
 
-def _lookup_volume(vid: str) -> dict:
-    con = sqlite3.connect(database.DB_PATH)
-    con.row_factory = sqlite3.Row
-    cur = con.cursor()
-    cur.execute("SELECT * FROM cloud_volumes WHERE id=?", (vid,))
-    row = cur.fetchone()
-    con.close()
-    if row is None:
-        return {"volume": vid, "note": "volume not found (would be no-op)"}
-    return {
-        "volume_id": row["id"],
-        "volume_name": row["name"],
-        "size_gb": row["size_gb"],
-        "attached_to": row["attached_to"],
-        "backups_also_deleted": bool(row["has_backups"]),
-    }
+def blocked(reason: str) -> Decision:
+    return Decision("blocked", reason)
+
+
+def classify_shell(db: sqlite3.Connection, command: str) -> Decision:
+    if command in SAFE_SHELL:
+        return Decision("safe", "Allowlisted shell demonstration", impact={"simulated": True})
+    volume = re.fullmatch(r"vultr volume delete ([A-Za-z0-9_-]{1,64})", command)
+    if volume:
+        target = volume[1]
+        row = db.execute("SELECT * FROM cloud_volumes WHERE id=?", (target,)).fetchone()
+        impact = {
+            "simulated": True, "volume_id": target, "matched_fixture_volumes": int(row is not None),
+            "backup_deletion": "Not modeled",
+        }
+        if row is not None:
+            impact.update(volume_name=row["name"], size_gb=row["size_gb"],
+                          attached_to=row["attached_to"], fixture_has_backups=bool(row["has_backups"]))
+        return Decision("destructive", "Mock cloud volume deletion", impact=impact)
+    if re.fullmatch(r"rm -rf? [A-Za-z0-9_./-]+", command):
+        return Decision("destructive", "Simulated recursive removal",
+                        impact={"simulated": True, "target": command.split()[-1], "files_at_risk": "Not modeled"})
+    return blocked("Unsupported shell command or shell syntax")
+
+
+def primary_key_scope(statement: exp.Expression) -> bool:
+    where = statement.args.get("where")
+    test = where.this if where else None
+    return (
+        isinstance(test, exp.EQ)
+        and isinstance(test.left, exp.Column)
+        and not test.left.table
+        and test.left.name.lower() == "id"
+        and isinstance(test.right, exp.Literal)
+    )
 
 
 def classify_sql(sql: str) -> Decision:
     try:
-        parsed = sqlglot.parse(sql, dialect="sqlite")
-    except Exception as e:
-        return Decision(DESTRUCTIVE, f"unparseable SQL: {e}", {"sql": sql})
-    if not parsed:
-        return Decision(SAFE, "empty SQL", {})
+        statements = sqlglot.parse(sql, dialect="sqlite")
+    except (sqlglot.errors.SqlglotError, ValueError, RecursionError):
+        return blocked("SQL could not be parsed")
+    if len(statements) != 1:
+        return blocked("Submit exactly one SQL statement")
+    statement = statements[0]
+    if isinstance(statement, exp.Select):
+        return Decision("safe", "Read from the demo fixtures", sql)
 
-    worst = SAFE
-    reasons: list[str] = []
-    blast: dict = {"sql": sql}
+    target = statement.this if statement is not None else None
+    table = target.this if isinstance(target, exp.Schema) else target
+    if (
+        not isinstance(table, exp.Table) or not isinstance(table.this, exp.Identifier)
+        or table.db or table.catalog or table.alias or table.name.lower() not in database.TABLES
+    ):
+        return blocked("SQL must target one allowlisted demo table")
+    name = table.name.lower()
 
-    for stmt in parsed:
-        if stmt is None:
-            continue
-        if isinstance(stmt, exp.Select):
-            reasons.append("SELECT")
-            continue
-        if isinstance(stmt, exp.Drop):
-            worst = DESTRUCTIVE
-            reasons.append(f"DROP {stmt.args.get('kind') or ''}".strip())
-        elif isinstance(stmt, exp.TruncateTable):
-            worst = DESTRUCTIVE
-            reasons.append("TRUNCATE")
-        elif isinstance(stmt, exp.Delete):
-            if stmt.args.get("where") is None:
-                worst = DESTRUCTIVE
-                reasons.append("DELETE without WHERE")
-            else:
-                if worst != DESTRUCTIVE:
-                    worst = REVERSIBLE
-                reasons.append("DELETE with WHERE")
-        elif isinstance(stmt, exp.Update):
-            if stmt.args.get("where") is None:
-                worst = DESTRUCTIVE
-                reasons.append("UPDATE without WHERE")
-            else:
-                if worst != DESTRUCTIVE:
-                    worst = REVERSIBLE
-                reasons.append("UPDATE with WHERE")
-        elif isinstance(stmt, exp.Insert):
-            if worst != DESTRUCTIVE:
-                worst = REVERSIBLE
-            reasons.append("INSERT")
-        elif isinstance(stmt, exp.AlterTable):
-            worst = DESTRUCTIVE
-            reasons.append("ALTER TABLE")
+    if isinstance(statement, exp.Drop):
+        if not re.fullmatch(rf"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:{name}|\"{name}\")\s*;?", sql, re.I):
+            return blocked("Only a plain DROP TABLE can be reviewed")
+        return Decision("destructive", "Fixture table removal", sql, sqlite3.SQLITE_DROP_TABLE, name)
+    if isinstance(statement, exp.Update):
+        if any(value for key, value in statement.args.items() if key not in {"this", "expressions", "where"}):
+            return blocked("Unsupported UPDATE syntax")
+        scoped = primary_key_scope(statement) and all(
+            isinstance(assignment, exp.EQ)
+            and isinstance(assignment.left, exp.Column)
+            and assignment.left.name.lower() not in {"id", "rowid", "_rowid_", "oid"}
+            for assignment in statement.expressions
+        )
+        return Decision("reversible" if scoped else "destructive",
+                        "Primary-key scoped UPDATE" if scoped else "UPDATE requires review",
+                        sql, sqlite3.SQLITE_UPDATE, name)
+    if isinstance(statement, exp.Delete):
+        if any(value for key, value in statement.args.items() if key not in {"this", "where"}):
+            return blocked("Unsupported DELETE syntax")
+        scoped = primary_key_scope(statement)
+        return Decision("reversible" if scoped else "destructive",
+                        "Primary-key scoped DELETE" if scoped else "DELETE requires review",
+                        sql, sqlite3.SQLITE_DELETE, name)
+    if isinstance(statement, exp.Insert):
+        if isinstance(statement.expression, exp.Values) and not any(
+            value for key, value in statement.args.items() if key not in {"this", "expression"}
+        ):
+            return Decision("reversible", "Insert values into a demo table", sql, sqlite3.SQLITE_INSERT, name)
+    return blocked("Unsupported SQL statement")
+
+
+def run_sql(db: sqlite3.Connection, decision: Decision) -> dict:
+    denied = False
+
+    def authorize(code, first, second, schema, source):
+        nonlocal denied
+        # DROP is checked by an exact pattern and needs internal schema writes.
+        # All other statements use this authorizer.
+        if (
+            code == sqlite3.SQLITE_SELECT
+            or (code == sqlite3.SQLITE_READ and schema in (None, "main") and first in database.TABLES)
+            or (code == sqlite3.SQLITE_FUNCTION and second in READ_FUNCTIONS)
+            or (not source and code == decision.operation and schema == "main" and first == decision.table)
+        ):
+            return sqlite3.SQLITE_OK
+        denied = True
+        return sqlite3.SQLITE_DENY
+
+    deadline = monotonic() + 0.2
+    db.set_progress_handler(lambda: monotonic() > deadline, 1000)
+    is_drop = decision.operation == sqlite3.SQLITE_DROP_TABLE
+    if not is_drop:
+        db.set_authorizer(authorize)
+    before = db.total_changes
+    try:
+        cursor = db.execute(decision.sql)
+        if cursor.description:
+            rows = []
+            size = 0
+            for row in cursor.fetchmany(101):
+                value = {
+                    key: str(item) if isinstance(item, float) and not math.isfinite(item) else item
+                    for key, item in dict(row).items()
+                }
+                encoded = json.dumps(value, default=str)
+                size += len(encoded)
+                if len(rows) == 100 or size > 65536:
+                    return {"ok": True, "rows": rows, "truncated": True}
+                rows.append(json.loads(encoded))
+            return {"ok": True, "rows": rows, "truncated": False}
+        return {
+            "ok": True,
+            "rows_affected": db.total_changes - before if not is_drop else None,
+        }
+    except sqlite3.Error as error:
+        if denied:
+            return {"ok": False, "error": "Unsupported SQL table, function or operation", "blocked": True}
+        return {"ok": False, "error": str(error)}
+    finally:
+        db.set_authorizer(None)
+        db.set_progress_handler(None, 0)
+
+
+def preview(db: sqlite3.Connection, decision: Decision) -> tuple[dict, bool]:
+    before = database.stats(db)
+    with closing(database.empty_database()) as copy:
+        db.backup(copy)
+        result = run_sql(copy, decision)
+        after = database.stats(copy) if result["ok"] else before
+    diffs = {
+        table: {"before": count, "after": after[table], "rows_lost": max(0, count - (after[table] or 0)),
+                "rows_added": max(0, (after[table] or 0) - count)}
+        for table, count in before.items() if count != after[table]
+    }
+    affected = result.get("rows_affected") or 0
+    if result["ok"] and decision.operation == sqlite3.SQLITE_DROP_TABLE:
+        affected = before[decision.table] or 0
+    return {
+        "scope": "disposable SQLite fixtures", "would_succeed": result["ok"],
+        "table": decision.table, "rows_affected": affected,
+        "table_diffs": diffs, "error": result.get("error"),
+    }, result.get("blocked", False)
+
+
+def decide_and_route(demo: Demo, kind: str, action: str) -> dict:
+    action = action.strip(" \t")
+    if not action or len(action) > MAX_ACTION or "\x00" in action:
+        decision = blocked("Empty, oversized or invalid proposal")
+    elif kind == "sql":
+        decision = classify_sql(action)
+    elif kind == "shell":
+        decision = classify_shell(demo.db, action)
+    else:
+        decision = blocked("Unknown action kind")
+    impact = decision.impact
+    if decision.operation is not None:
+        impact, denied = preview(demo.db, decision)
+        if denied:
+            decision = blocked(impact["error"])
+    payload = {"classification": decision.classification, "reason": decision.reason, "blast_radius": impact}
+
+    if decision.classification == "blocked":
+        status = "blocked"
+    elif decision.classification == "destructive" and len(demo.pending) >= 25:
+        status = "blocked"
+        payload["reason"] = "Pending queue is full"
+    elif decision.classification == "destructive":
+        pid = demo.next_id
+        demo.next_id += 1
+        demo.pending[pid] = {
+            "id": pid, "created_at": database.timestamp(), "kind": kind, "action": action,
+            "classification": decision.classification, "blast_radius": impact, "revision": demo.revision,
+        }
+        payload["pending_id"] = pid
+        status = "pending-approval"
+    else:
+        if impact.get("would_succeed") is False:
+            result = {"ok": False, "error": impact["error"]}
         else:
-            if worst == SAFE:
-                worst = REVERSIBLE
-            reasons.append(stmt.key.upper())
-
-    if worst == DESTRUCTIVE:
-        blast.update(_dry_run_sql(sql))
-    return Decision(worst, "; ".join(reasons), blast)
-
-
-def _dry_run_sql(sql: str) -> dict:
-    """Open a transaction, execute, count what changed, roll back."""
-    before = database.stats()
-    affected: dict = {}
-    error: str | None = None
-    con = sqlite3.connect(database.DB_PATH)
-    try:
-        con.execute("BEGIN")
-        for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
-            try:
-                cur = con.execute(stmt)
-                affected[stmt[:80]] = cur.rowcount
-            except sqlite3.Error as e:
-                error = str(e)
-                break
-        after = {}
-        for t in ("customers", "orders", "cloud_volumes"):
-            try:
-                after[t] = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-            except sqlite3.Error:
-                after[t] = None
-        con.execute("ROLLBACK")
-    finally:
-        con.close()
-
-    diffs = {}
-    for t, n_before in before.items():
-        n_after = after.get(t)
-        if n_after is None:
-            diffs[t] = {"before": n_before, "after": "table missing", "lost": n_before}
-        elif n_after != n_before:
-            diffs[t] = {"before": n_before, "after": n_after, "lost": n_before - n_after}
-    return {"dry_run": {"affected_statements": affected, "table_diffs": diffs, "error": error}}
-
-
-def classify(kind: str, action: str) -> Decision:
-    if kind == "sql":
-        return classify_sql(action)
-    if kind == "shell":
-        return classify_shell(action)
-    return Decision(DESTRUCTIVE, f"unknown action kind: {kind}", {"action": action})
-
-
-def execute_shell(cmd: str) -> dict:
-    """Stub executor — the demo doesn't need to really run shell."""
-    database.log_audit(cmd, "shell", "", "executed")
-    return {"ok": True, "stdout": f"[simulated] ran: {cmd}", "note": "demo stub"}
-
-
-def execute_sql(sql: str) -> dict:
-    con = sqlite3.connect(database.DB_PATH)
-    results: list = []
-    try:
-        for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
-            cur = con.execute(stmt)
-            if cur.description:
-                rows = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()[:100]]
-                results.append({"sql": stmt, "rows": rows})
-            else:
-                results.append({"sql": stmt, "rowcount": cur.rowcount})
-        con.commit()
-    except sqlite3.Error as e:
-        con.rollback()
-        return {"ok": False, "error": str(e), "results": results}
-    finally:
-        con.close()
-    database.log_audit(sql, "sql", "", "executed")
-    return {"ok": True, "results": results}
-
-
-def decide_and_route(kind: str, action: str) -> dict:
-    d = classify(kind, action)
-    payload = {"classification": d.classification, "reason": d.reason, "blast_radius": d.blast_radius}
-    if d.classification == SAFE:
-        exec_fn = execute_sql if kind == "sql" else execute_shell
-        result = exec_fn(action)
-        payload["status"] = "executed"
+            result = execute(demo, decision)
+        if result.pop("blocked", False):
+            payload.update(classification="blocked", reason=result["error"])
+            status = "blocked"
+        elif not result["ok"]:
+            status = "failed"
+        else:
+            status = {"safe": "executed", "reversible": "executed-reversible"}[decision.classification]
+            if kind == "shell":
+                status = "simulated"
         payload["result"] = result
-        return payload
-    if d.classification == REVERSIBLE:
-        exec_fn = execute_sql if kind == "sql" else execute_shell
-        result = exec_fn(action)
-        payload["status"] = "executed-reversible"
-        payload["result"] = result
-        return payload
-    pid = database.enqueue(kind, action, d.classification, json.dumps(d.blast_radius))
-    database.log_audit(action, d.classification, json.dumps(d.blast_radius), "blocked-pending-approval")
-    payload["status"] = "pending-approval"
-    payload["pending_id"] = pid
-    return payload
+    demo.log(kind, action[:MAX_ACTION], payload["classification"], status, impact)
+    return {**payload, "status": status}
 
 
-def approve(pid: int) -> dict:
-    row = database.resolve(pid, "approved")
+def execute(demo: Demo, decision: Decision) -> dict:
+    if decision.classification not in {"safe", "reversible"}:
+        raise ValueError("Only safe or scoped fixture operations can execute")
+    if decision.sql is None:
+        return {"ok": True, "simulated": True, "message": "Shell command recorded as a simulation."}
+    result = run_sql(demo.db, decision)
+    if result["ok"] and decision.operation is not None:
+        demo.revision += 1
+    return result
+
+
+def pending(demo: Demo) -> list[dict]:
+    return [
+        {key: value for key, value in row.items() if key != "revision"}
+        for row in reversed(demo.pending.values())
+    ]
+
+
+def resolve(demo: Demo, pid: int, approve: bool) -> dict | None:
+    row = demo.pending.pop(pid, None)
     if row is None:
-        return {"ok": False, "error": "pending action not found"}
-    exec_fn = execute_sql if row["kind"] == "sql" else execute_shell
-    result = exec_fn(row["action"])
-    database.log_audit(row["action"], row["classification"], row["blast_radius"], "approved-executed")
-    return {"ok": True, "result": result}
-
-
-def reject(pid: int, reason: str = "human rejected") -> dict:
-    row = database.resolve(pid, "rejected")
-    if row is None:
-        return {"ok": False, "error": "pending action not found"}
-    database.log_audit(row["action"], row["classification"], row["blast_radius"], f"rejected: {reason}")
-    return {"ok": True, "message": "action blocked"}
+        return None
+    if not approve:
+        status, result = "rejected", {"ok": True, "message": "Action blocked."}
+    elif row["revision"] != demo.revision:
+        status, result = "stale", {"ok": False, "message": "Fixtures changed. Analyze the action again."}
+    else:
+        status = "approved-simulated"
+        result = {
+            "ok": True, "simulated": True, "blast_radius": row["blast_radius"],
+            "message": "Approval recorded. The simulation left all fixtures intact.",
+        }
+    demo.log(row["kind"], row["action"], row["classification"], status, row["blast_radius"])
+    return {**result, "status": status}
