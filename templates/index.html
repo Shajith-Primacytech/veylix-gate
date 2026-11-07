@@ -50,7 +50,7 @@
 
     <section class="card">
       <h2>Try an action</h2>
-      <form method="post" action="/action" onsubmit="return submitJSON(this, 'actionOut')">
+      <form method="post" action="/action" onsubmit="submitJSON(event, this, 'actionOut'); return false;">
         <select name="kind">
           <option value="sql">sql</option>
           <option value="shell">shell</option>
@@ -99,10 +99,10 @@
   </main>
 
 <script>
-async function submitJSON(form, outId){
-  event.preventDefault();
+async function submitJSON(ev, form, outId){
+  ev.preventDefault();
   const fd = new FormData(form);
-  const r = await fetch(form.action, {method:'POST', body:fd});
+  const r = await fetch(form.getAttribute("action"), {method:'POST', body:fd});
   const j = await r.json();
   document.getElementById(outId).textContent = JSON.stringify(j, null, 2);
   setTimeout(()=>location.reload(), 800);
