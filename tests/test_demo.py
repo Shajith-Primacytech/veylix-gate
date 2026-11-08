@@ -1,3 +1,4 @@
+import json
 import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -9,6 +10,7 @@ from fastapi.testclient import TestClient
 
 import agent
 import app
+import isolated
 import repair
 
 ORIGIN = "https://demo.example"
@@ -185,7 +187,8 @@ def test_vultr_provider_response_and_fail_closed(client, monkeypatch):
         assert request.headers["authorization"] == "Bearer test-vultr-key"
         return httpx.Response(200, json={
             "id": "test-completion", "model": "test-model",
-            "choices": [{"message": {"content": '{"kind":"shell","action":"git reset --hard"}'}}],
+            "choices": [{"finish_reason": "stop",
+                         "message": {"content": '{"kind":"shell","action":"git reset --hard"}'}}],
         })
 
     client_class = httpx.AsyncClient
@@ -211,7 +214,7 @@ def test_vultr_safe_proposal_and_invalid_response(client, monkeypatch):
     def fake_provider(request):
         return httpx.Response(200, json={
             "id": "test-completion", "model": "test-model",
-            "choices": [{"message": {"content": next(proposals)}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": next(proposals)}}],
         })
 
     client_class = httpx.AsyncClient
@@ -247,6 +250,80 @@ def repair_step(client, auth, step, **body):
     response = client.post(f"/api/repair/{step}", headers=auth, json=body)
     assert response.status_code == 200, response.text
     return response.json()["run"]
+
+
+@pytest.mark.parametrize(("http_status", "finish_reason", "content", "truncated"), [
+    (200, "length", '{"operation":"provider-private-content', True),
+    (200, "length", '{"operation":"enable_sample_job"}', True),
+    (200, "stop", '{"operation":"provider-private-content"', False),
+    (200, "stop", '{"operation":"provider-private-content"}', False),
+    (200, "stop", '{"operation":"enable_sample_job","sql":"provider-private-content"}', False),
+    (200, "stop", '{"operation":"provider-private-content","operation":"enable_sample_job"}', False),
+    (200, "tool_calls", '{"operation":"enable_sample_job"}', False),
+    (200, None, '{"operation":"enable_sample_job"}', False),
+    (429, None, "provider-private-content", False),
+    (503, None, "provider-private-content", False),
+    (200, "stop", '{"operation":"enable_sample_job"}', False),
+])
+def test_isolated_repair_proposal(client, monkeypatch, caplog, http_status, finish_reason, content, truncated):
+    monkeypatch.setenv("VEYLIX_ISOLATED", "1")
+    monkeypatch.setenv("VEYLIX_JUDGE_ORIGIN", "https://backend.example")
+    client.headers["Origin"] = "https://backend.example"
+    monkeypatch.setenv("VULTR_INFERENCE_API_KEY", "test-vultr-key")
+    monkeypatch.setenv("VULTR_INFERENCE_MODEL", "glm-5.3")
+    monkeypatch.delenv(agent.REPAIR_TOKEN_ENV, raising=False)
+    budget = 1024
+    accepted = http_status == 200 and finish_reason == "stop" and content == '{"operation":"enable_sample_job"}'
+    if accepted:
+        budget = 1536
+        monkeypatch.setenv(agent.REPAIR_TOKEN_ENV, str(budget))
+
+    async def observe_only(op, job):
+        assert (op, job) == ("observe", 7)
+        return {"before": isolated.FAILED, "fixture_sha256": "a" * 64}, []
+
+    def provider(request):
+        assert str(request.url) == agent.URL
+        body = json.loads(request.content)
+        assert body["max_completion_tokens"] == budget
+        assert body["model"] == "glm-5.3"
+        assert "max_tokens" not in body
+        assert "7" in body["messages"][-1]["content"]
+        choice = {"message": {"content": content}}
+        if finish_reason is not None:
+            choice["finish_reason"] = finish_reason
+        return httpx.Response(http_status, json={
+            "id": "repair-completion", "model": "glm-5.3", "choices": [choice],
+        })
+
+    monkeypatch.setattr(isolated, "task", observe_only)
+    client_class = httpx.AsyncClient
+    monkeypatch.setattr(agent.httpx, "AsyncClient",
+                        lambda **kwargs: client_class(transport=httpx.MockTransport(provider), **kwargs))
+    auth = login(client)
+    started = repair_step(client, auth, "start", job_id=7)
+    run_id = started["run_id"]
+    diagnosed = client.post("/api/repair/diagnose", headers=auth, json={"run_id": run_id})
+    run = client.get("/api/repair").json()["run"]
+    if accepted:
+        assert diagnosed.status_code == 200
+        assert run["status"] == "awaiting-approval"
+        assert run["plan"]["operation"] == "enable_sample_job"
+        assert run["plan"]["sql"] == repair.UPDATE
+        assert run["plan"]["parameters"] == [7]
+        assert run["audit"][-1]["evidence"]["inference"] == {
+            "provider": "Vultr Serverless Inference", "completion_id": "repair-completion", "model": "glm-5.3",
+        }
+        assert repair_step(client, auth, "decide", run_id=run_id, decision="reject")["status"] == "rejected"
+    else:
+        assert diagnosed.status_code == 502
+        assert ("finish_reason=length, max_completion_tokens=1024" in diagnosed.json()["detail"]) == truncated
+        assert run == started
+        assert client.post("/api/repair/decide", headers=auth,
+                           json={"run_id": run_id, "decision": "approve"}).status_code == 409
+    for sensitive in ("test-vultr-key", "provider-private-content", "Authorization"):
+        assert sensitive not in diagnosed.text
+        assert sensitive not in caplog.text
 
 
 def prepare_repair(client, auth, job_id=7):

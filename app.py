@@ -427,6 +427,9 @@ async def repair_diagnose(request: Request):
         run.status = "diagnosing"
         try:
             evidence = await asyncio.wait_for(agent.propose_repair(run.job_id), timeout=12)
+        except agent.InferenceTruncated as error:
+            run.status = "failure-observed"
+            raise HTTPException(502, str(error)) from None
         except (ValueError, TimeoutError):
             run.status = "failure-observed"
             raise HTTPException(502, "Vultr inference could not produce a valid proposal") from None

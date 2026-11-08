@@ -174,3 +174,5 @@ curl --max-time 10 -sS -o /dev/null -w '%{http_code}\n' "$STAGING_ORIGIN/api/aud
 ```
 
 For staging, FastAPI requires `GATE_DEMO_ACCESS_CODE`, `GATE_PROXY_TOKEN`, and the exact browser origin in `GATE_ALLOWED_ORIGINS`. Caddy or ngrok uses `GATE_BACKEND_HOST`, and the tunnel also uses `NGROK_AUTHTOKEN`. The Vercel gateway requires `GATE_BACKEND_ORIGIN` as a bare HTTPS origin and a matching `GATE_PROXY_TOKEN`. Vultr inference requires `VULTR_INFERENCE_API_KEY` and `VULTR_INFERENCE_MODEL` on the backend. Keep all credentials in the authorized secret store. [Staging operator runbook at the audited revision](https://github.com/Shajith-Primacytech/veylix-gate/blob/a59d08e8ccecaf1308dbafefb70b9b06a22c85c3/README.md#stage-the-feature-branch)
+
+For isolated RepairLab, `VULTR_REPAIR_MAX_COMPLETION_TOKENS` sets Vultr's `max_completion_tokens` and defaults to 1024. A truncated response returns HTTP 502 and leaves the observed failure available for another diagnosis attempt. [Vultr Chat Completion API](https://api.vultrinference.com/docs/reference/create-chat-completion)
