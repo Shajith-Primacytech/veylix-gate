@@ -3,7 +3,7 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py agent.py database.py gate.py ./
+COPY app.py agent.py database.py gate.py repair.py isolated.py ./
 COPY templates ./templates
 USER 10001:10001
 EXPOSE 8000

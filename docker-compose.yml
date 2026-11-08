@@ -7,6 +7,7 @@ services:
       GATE_ALLOWED_ORIGINS: ${GATE_ALLOWED_ORIGINS:?Set the approved HTTPS Vercel origin}
       VULTR_INFERENCE_API_KEY: ${VULTR_INFERENCE_API_KEY:-}
       VULTR_INFERENCE_MODEL: ${VULTR_INFERENCE_MODEL:-}
+      VULTR_REPAIR_MAX_COMPLETION_TOKENS: ${VULTR_REPAIR_MAX_COMPLETION_TOKENS:-1024}
     read_only: true
     restart: unless-stopped
   caddy:

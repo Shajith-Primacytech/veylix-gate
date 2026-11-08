@@ -1,0 +1,24 @@
+[Unit]
+Description=Veylix RepairLab staging task broker
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/veylix-gate/worker-image.env
+WorkingDirectory=/opt/veylix-challenge1/sandbox
+ExecStart=/usr/bin/python3 -B /opt/veylix-challenge1/sandbox/orchestrator.py ${VEYLIX_WORKER_IMAGE}
+RuntimeDirectory=veylix-sandbox
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=restart
+UMask=0077
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veylix RepairLab</title>
+<script defer src="/judge.js"></script>
+<main>
+<h1>Veylix RepairLab</h1>
+<p>Repair a broken SQLite sample using Vultr inference and disposable Docker workers.</p>
+<p id="notice" role="status" aria-live="polite"></p>
+<form id="login" method="post" action="/session">
+  <label>Judge access code <input name="access_code" type="password" required autocomplete="current-password"></label>
+  <button>Sign in</button>
+</form>
+<section id="workspace" hidden>
+  <form id="start">
+    <label>Sample job <input name="job_id" type="number" min="1" max="20" value="7" required></label>
+    <button>Create and run broken sample</button>
+  </form>
+  <h2 id="status">No active run</h2>
+  <button id="diagnose" type="button" hidden>Request Vultr AI proposal</button>
+  <button id="approve" type="button" hidden>Approve and run isolated repair</button>
+  <button id="reject" type="button" hidden>Reject proposal</button>
+  <pre id="details"></pre>
+  <button id="export" type="button" hidden>Download audit JSON</button>
+  <button id="logout" type="button">Sign out</button>
+</section>
+</main>
+</html>

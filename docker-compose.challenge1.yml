@@ -1,0 +1,14 @@
+# Apply only to the approved isolated tunnel stack, after the host broker is running.
+services:
+  gate:
+    environment:
+      VEYLIX_ISOLATED: "1"
+      VEYLIX_JUDGE_ORIGIN: https://${GATE_BACKEND_HOST:?Set the approved staging hostname}
+      VEYLIX_REVISION: ${VEYLIX_REVISION:?Set the reviewed Git revision}
+    volumes:
+      - type: bind
+        source: /run/veylix-sandbox
+        target: /run/veylix-sandbox
+        read_only: true
+        bind:
+          create_host_path: false

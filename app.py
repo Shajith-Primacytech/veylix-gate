@@ -4,6 +4,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 from collections import deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -12,12 +13,14 @@ from time import monotonic
 from urllib.parse import parse_qsl, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 import agent
 import database
 import gate
+import isolated
+import repair
 
 SESSION_TTL = 30 * 60
 MAX_SESSIONS = 64
@@ -31,9 +34,11 @@ templates = Jinja2Templates(directory=str(Path(__file__).with_name("templates"))
 class Session:
     expires: float
     csrf: str = field(default_factory=lambda: secrets.token_urlsafe(32))
-    demo: gate.Demo = field(default_factory=gate.Demo)
+    demo: gate.Demo | None = field(default_factory=lambda: None if isolated.enabled() else gate.Demo())
     requests: deque = field(default_factory=deque)
     inference: deque = field(default_factory=deque)
+    repair_actor: str = field(default_factory=lambda: secrets.token_hex(16))
+    repair_run: repair.Run | isolated.Run | None = None
 
 
 class Sessions:
@@ -45,7 +50,11 @@ class Sessions:
         self.inflight_inference = 0
 
     def discard(self, sid: str):
-        self.active.pop(sid).demo.db.close()
+        session = self.active.pop(sid)
+        if session.demo is not None:
+            session.demo.db.close()
+        if session.repair_run is not None:
+            session.repair_run.close()
 
     def expire(self):
         for sid, session in list(self.active.items()):
@@ -99,12 +108,40 @@ def local_request(request: Request) -> bool:
     )
 
 
+JUDGE_PATHS = {
+    "/", "/judge.js", "/healthz", "/session", "/logout", "/api/audit", "/api/repair",
+    "/api/repair/start", "/api/repair/diagnose", "/api/repair/decide",
+}
+
+
+def judge_origin():
+    return os.environ.get("VEYLIX_JUDGE_ORIGIN", "")
+
+
+def judge_request(request):
+    origin = judge_origin()
+    return bool(re.fullmatch(r"https://[a-zA-Z0-9.-]+(?::[0-9]{1,5})?", origin)
+                and request.headers.get("host") == urlsplit(origin).netloc)
+
+
 @app.middleware("http")
 async def guard(request: Request, call_next):
     proxy_token = os.environ.get("GATE_PROXY_TOKEN", "")
     local = local_request(request)
     proxied = len(proxy_token) >= 32 and matches(request.headers.get("x-gate-proxy-token", ""), proxy_token)
-    if request.url.path == "/healthz" or local or proxied:
+    request.state.proxied = proxied
+    if isolated.enabled():
+        request.state.local = False
+        if request.url.path == "/healthz" or (judge_request(request) and request.url.path in JUDGE_PATHS):
+            response = await call_next(request)
+        else:
+            response = JSONResponse({"detail": "Route unavailable"}, status_code=403)
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; script-src 'self'; connect-src 'self'; "
+            "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        )
+        response.headers["Strict-Transport-Security"] = "max-age=86400"
+    elif request.url.path == "/healthz" or local or proxied:
         request.state.local = local
         response = await call_next(request)
     else:
@@ -121,6 +158,8 @@ def require_origin(request: Request):
         [os.environ.get("GATE_LOCAL_ORIGIN")] if request.state.local
         else os.environ.get("GATE_ALLOWED_ORIGINS", "").split(",")
     )
+    if isolated.enabled():
+        configured = [judge_origin(), *configured] if request.state.proxied else [judge_origin()]
     origin = request.headers.get("origin")
     if not origin or origin not in configured or (not request.state.local and not origin.startswith("https://")):
         raise HTTPException(403, "Origin not allowed")
@@ -191,6 +230,8 @@ async def mutation(request: Request, *, form_token: bool = False) -> tuple[Sessi
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
+    if isolated.enabled():
+        return FileResponse(Path(__file__).with_name("templates") / "judge.html")
     if not request.state.local:
         raise HTTPException(404)
     try:
@@ -208,6 +249,13 @@ async def home(request: Request):
         "stats": database.stats(session.demo.db), "pending": gate.pending(session.demo),
         "audit": list(session.demo.audit)[:25], "csrf": session.csrf,
     })
+
+
+@app.get("/judge.js")
+async def judge_script():
+    if not isolated.enabled():
+        raise HTTPException(404)
+    return FileResponse(Path(__file__).with_name("templates") / "judge.js", media_type="text/javascript")
 
 
 @app.post("/session")
@@ -314,9 +362,109 @@ async def api_pending(request: Request):
 
 @app.get("/api/audit")
 async def api_audit(request: Request):
-    return {"audit": list(require_session(request).demo.audit)}
+    session = require_session(request)
+    if isolated.enabled():
+        return {"audit": session.repair_run.events if session.repair_run else []}
+    return {"audit": list(session.demo.audit)}
+
+
+@app.get("/api/repair")
+async def repair_status(request: Request):
+    run = require_session(request).repair_run
+    return {"run": run.summary() if run else None}
+
+
+@app.post("/api/repair/start")
+async def repair_start(request: Request):
+    session, data = await mutation(request)
+    job_id = data.get("job_id")
+    if data.keys() != {"job_id"} or type(job_id) is not int or not 1 <= job_id <= repair.MAX_JOB_ID:
+        raise HTTPException(400, "Choose a sample job from 1 through 20")
+    previous = session.repair_run
+    if previous is not None and previous.status not in repair.TERMINAL:
+        raise HTTPException(409, "Finish reviewing the current workload first")
+    if isolated.enabled():
+        run = isolated.Run(job_id, session.repair_actor)
+        session.repair_run = run
+        await run.observe()
+        if require_session(request, charge=False) is not session:
+            raise HTTPException(401, "Session expired")
+        return {"run": run.summary()}
+    try:
+        run = repair.Run(job_id, session.repair_actor)
+    except sqlite3.Error:
+        raise HTTPException(503, "The sample failure could not be verified") from None
+    session.repair_run = run
+    if previous is not None:
+        previous.close()
+    return {"run": run.summary()}
+
+
+def reviewable_run(session: Session, data: dict, expected_status: str) -> repair.Run | isolated.Run:
+    run_id = data.get("run_id")
+    run = session.repair_run
+    if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        raise HTTPException(400, "Invalid repair run ID")
+    if run is None or run.id != run_id:
+        raise HTTPException(404, "Repair run not found")
+    if run.status != expected_status:
+        raise HTTPException(409, "This repair step is no longer available")
+    return run
+
+
+@app.post("/api/repair/diagnose")
+async def repair_diagnose(request: Request):
+    session, data = await mutation(request)
+    if data.keys() != {"run_id"}:
+        raise HTTPException(400, "Send only the repair run ID")
+    run = reviewable_run(session, data, "failure-observed")
+    if isinstance(run, isolated.Run):
+        sessions = request.app.state.sessions
+        limit(session.inference, 3)
+        limit(sessions.inference_requests, 12)
+        if sessions.inflight_inference >= 3:
+            raise HTTPException(429, "Inference is busy", headers={"Retry-After": "5"})
+        sessions.inflight_inference += 1
+        run.status = "diagnosing"
+        try:
+            evidence = await asyncio.wait_for(agent.propose_repair(run.job_id), timeout=12)
+        except agent.InferenceTruncated as error:
+            run.status = "failure-observed"
+            raise HTTPException(502, str(error)) from None
+        except (ValueError, TimeoutError):
+            run.status = "failure-observed"
+            raise HTTPException(502, "Vultr inference could not produce a valid proposal") from None
+        finally:
+            sessions.inflight_inference -= 1
+        if require_session(request, charge=False) is not session:
+            raise HTTPException(401, "Session expired")
+        run.diagnose(evidence)
+        return {"run": run.summary()}
+    try:
+        run.diagnose()
+    except sqlite3.Error:
+        run.record("repair-failed", {"phase": "diagnosis", "committed": False})
+    return {"run": run.summary()}
+
+
+@app.post("/api/repair/decide")
+async def repair_decide(request: Request):
+    session, data = await mutation(request)
+    if data.keys() != {"run_id", "decision"} or data.get("decision") not in ("approve", "reject"):
+        raise HTTPException(400, "Choose approve or reject for the repair run")
+    run = reviewable_run(session, data, "awaiting-approval")
+    if isinstance(run, isolated.Run):
+        await run.decide(data["decision"] == "approve")
+        if require_session(request, charge=False) is not session:
+            raise HTTPException(401, "Session expired")
+    else:
+        run.decide(data["decision"] == "approve")
+    return {"run": run.summary()}
 
 
 @app.get("/healthz")
 async def healthz():
+    if isolated.enabled():
+        return {"ok": True, "service": "veylix-gate", "mode": isolated.MODE,
+                "revision": os.environ.get("VEYLIX_REVISION", "unrecorded")}
     return {"ok": True, "service": "veylix-gate"}

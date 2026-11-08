@@ -1,5 +1,8 @@
+import json
 import re
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 import httpx
 import pytest
@@ -7,6 +10,8 @@ from fastapi.testclient import TestClient
 
 import agent
 import app
+import isolated
+import repair
 
 ORIGIN = "https://demo.example"
 TOKEN = "test-gateway-token-" * 3
@@ -182,7 +187,8 @@ def test_vultr_provider_response_and_fail_closed(client, monkeypatch):
         assert request.headers["authorization"] == "Bearer test-vultr-key"
         return httpx.Response(200, json={
             "id": "test-completion", "model": "test-model",
-            "choices": [{"message": {"content": '{"kind":"shell","action":"git reset --hard"}'}}],
+            "choices": [{"finish_reason": "stop",
+                         "message": {"content": '{"kind":"shell","action":"git reset --hard"}'}}],
         })
 
     client_class = httpx.AsyncClient
@@ -208,7 +214,7 @@ def test_vultr_safe_proposal_and_invalid_response(client, monkeypatch):
     def fake_provider(request):
         return httpx.Response(200, json={
             "id": "test-completion", "model": "test-model",
-            "choices": [{"message": {"content": next(proposals)}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": next(proposals)}}],
         })
 
     client_class = httpx.AsyncClient
@@ -238,3 +244,284 @@ def test_legacy_form_fix(monkeypatch):
         assert local.post(f"/reject/{report['pending_id']}", data={"csrf": csrf},
                           follow_redirects=False).status_code == 303
         assert "rejected" in local.get("/").text
+
+
+def repair_step(client, auth, step, **body):
+    response = client.post(f"/api/repair/{step}", headers=auth, json=body)
+    assert response.status_code == 200, response.text
+    return response.json()["run"]
+
+
+@pytest.mark.parametrize(("http_status", "finish_reason", "content", "truncated"), [
+    (200, "length", '{"operation":"provider-private-content', True),
+    (200, "length", '{"operation":"enable_sample_job"}', True),
+    (200, "stop", '{"operation":"provider-private-content"', False),
+    (200, "stop", '{"operation":"provider-private-content"}', False),
+    (200, "stop", '{"operation":"enable_sample_job","sql":"provider-private-content"}', False),
+    (200, "stop", '{"operation":"provider-private-content","operation":"enable_sample_job"}', False),
+    (200, "tool_calls", '{"operation":"enable_sample_job"}', False),
+    (200, None, '{"operation":"enable_sample_job"}', False),
+    (429, None, "provider-private-content", False),
+    (503, None, "provider-private-content", False),
+    (200, "stop", '{"operation":"enable_sample_job"}', False),
+])
+def test_isolated_repair_proposal(client, monkeypatch, caplog, http_status, finish_reason, content, truncated):
+    monkeypatch.setenv("VEYLIX_ISOLATED", "1")
+    monkeypatch.setenv("VEYLIX_JUDGE_ORIGIN", "https://backend.example")
+    client.headers["Origin"] = "https://backend.example"
+    monkeypatch.setenv("VULTR_INFERENCE_API_KEY", "test-vultr-key")
+    monkeypatch.setenv("VULTR_INFERENCE_MODEL", "glm-5.3")
+    monkeypatch.delenv(agent.REPAIR_TOKEN_ENV, raising=False)
+    budget = 1024
+    accepted = http_status == 200 and finish_reason == "stop" and content == '{"operation":"enable_sample_job"}'
+    if accepted:
+        budget = 1536
+        monkeypatch.setenv(agent.REPAIR_TOKEN_ENV, str(budget))
+
+    async def observe_only(op, job):
+        assert (op, job) == ("observe", 7)
+        return {"before": isolated.FAILED, "fixture_sha256": "a" * 64}, []
+
+    def provider(request):
+        assert str(request.url) == agent.URL
+        body = json.loads(request.content)
+        assert body["max_completion_tokens"] == budget
+        assert body["model"] == "glm-5.3"
+        assert "max_tokens" not in body
+        assert "7" in body["messages"][-1]["content"]
+        choice = {"message": {"content": content}}
+        if finish_reason is not None:
+            choice["finish_reason"] = finish_reason
+        return httpx.Response(http_status, json={
+            "id": "repair-completion", "model": "glm-5.3", "choices": [choice],
+        })
+
+    monkeypatch.setattr(isolated, "task", observe_only)
+    client_class = httpx.AsyncClient
+    monkeypatch.setattr(agent.httpx, "AsyncClient",
+                        lambda **kwargs: client_class(transport=httpx.MockTransport(provider), **kwargs))
+    auth = login(client)
+    started = repair_step(client, auth, "start", job_id=7)
+    run_id = started["run_id"]
+    diagnosed = client.post("/api/repair/diagnose", headers=auth, json={"run_id": run_id})
+    run = client.get("/api/repair").json()["run"]
+    if accepted:
+        assert diagnosed.status_code == 200
+        assert run["status"] == "awaiting-approval"
+        assert run["plan"]["operation"] == "enable_sample_job"
+        assert run["plan"]["sql"] == repair.UPDATE
+        assert run["plan"]["parameters"] == [7]
+        assert run["plan"]["expected_after"] == {"status": "passed", "rows_returned": 1}
+        assert run["audit"][-1]["evidence"]["inference"] == {
+            "provider": "Vultr Serverless Inference", "completion_id": "repair-completion", "model": "glm-5.3",
+        }
+        assert repair_step(client, auth, "decide", run_id=run_id, decision="reject")["status"] == "rejected"
+    else:
+        assert diagnosed.status_code == 502
+        assert ("finish_reason=length, max_completion_tokens=1024" in diagnosed.json()["detail"]) == truncated
+        assert run == started
+        assert client.post("/api/repair/decide", headers=auth,
+                           json={"run_id": run_id, "decision": "approve"}).status_code == 409
+    for sensitive in ("test-vultr-key", "provider-private-content", "Authorization"):
+        assert sensitive not in diagnosed.text
+        assert sensitive not in caplog.text
+
+
+def prepare_repair(client, auth, job_id=7):
+    run = repair_step(client, auth, "start", job_id=job_id)
+    return repair_step(client, auth, "diagnose", run_id=run["run_id"])
+
+
+def current_repair():
+    return next(iter(app.app.state.sessions.active.values())).repair_run
+
+
+def test_repair_measures_before_and_after_and_records_server_evidence(client):
+    auth = login(client)
+    assert client.get("/api/repair").json() == {"run": None}
+    started = repair_step(client, auth, "start", job_id=17)
+    run_id = started["run_id"]
+    assert started["status"] == "failure-observed"
+    assert started["before"] == {"status": "failed", "rows_returned": 0}
+    assert started["plan"] is None
+    assert client.post("/api/repair/decide", headers=auth,
+                       json={"run_id": run_id, "decision": "approve"}).status_code == 409
+    assert client.post("/api/repair/start", headers=auth, json={"job_id": 3}).status_code == 409
+    diagnosed = repair_step(client, auth, "diagnose", run_id=run_id)
+    assert diagnosed["status"] == "awaiting-approval"
+    assert diagnosed["plan"]["sql"] == repair.UPDATE
+    assert diagnosed["plan"]["parameters"] == [17]
+    assert diagnosed["plan"]["expected_rows_updated"] == 1
+    assert client.portal.call(lambda: current_repair().measure()) == started["before"]
+
+    approved = repair_step(client, auth, "decide", run_id=run_id, decision="approve")
+    assert approved["status"] == "verified"
+    events = approved["audit"]
+    assert [event["status"] for event in events] == [
+        "failure-observed", "awaiting-approval", "approved", "verified",
+    ]
+    assert events[2]["evidence"]["plan"] == diagnosed["plan"]
+    assert events[3]["evidence"] == {
+        "rows_updated": 1, "before": {"status": "failed", "rows_returned": 0},
+        "after": {"status": "passed", "rows_returned": 1}, "committed": True,
+    }
+    assert client.portal.call(lambda: current_repair().measure()) == events[3]["evidence"]["after"]
+    assert len({event["event_id"] for event in events}) == 4
+    assert len({event["actor"] for event in events}) == 1
+    assert all(event["run_id"] == run_id and event["mode"] == "sqlite-fixture" for event in events)
+    times = [datetime.fromisoformat(event["ts"]) for event in events]
+    assert all(t.utcoffset().total_seconds() == 0 for t in times)
+    assert times == sorted(times)
+    readback = client.get("/api/repair")
+    assert readback.json()["run"] == approved
+    for secret in (CODE, TOKEN, auth["X-CSRF-Token"], client.cookies.get(app.SECURE_COOKIE)):
+        assert secret not in readback.text
+
+
+def test_repair_rejection_and_superseded_run(client):
+    auth = login(client)
+    run_id = prepare_repair(client, auth)["run_id"]
+    rejected = repair_step(client, auth, "decide", run_id=run_id, decision="reject")
+    assert rejected["status"] == "rejected"
+    assert rejected["audit"][-1]["evidence"] == {"rows_updated": 0}
+    assert client.portal.call(lambda: current_repair().measure()) == rejected["before"]
+    payload = {"run_id": run_id, "decision": "approve"}
+    assert client.post("/api/repair/decide", headers=auth, json=payload).status_code == 409
+    fresh = prepare_repair(client, auth, job_id=8)
+    assert fresh["run_id"] != run_id
+    assert client.post("/api/repair/decide", headers=auth, json=payload).status_code == 404
+    assert client.get("/api/repair").json()["run"] == fresh
+
+
+def test_repair_approval_expires_without_execution(client, monkeypatch):
+    auth = login(client)
+    run = prepare_repair(client, auth)
+    monkeypatch.setattr(repair, "monotonic", lambda: current_repair().approval_deadline)
+    stale = repair_step(client, auth, "decide", run_id=run["run_id"], decision="approve")
+    assert stale["status"] == "stale"
+    assert [event["status"] for event in stale["audit"]] == ["failure-observed", "awaiting-approval", "stale"]
+    assert client.portal.call(lambda: current_repair().measure()) == stale["before"]
+
+
+def test_repair_execution_is_single_use_under_concurrency(client):
+    auth = login(client)
+    run_id = prepare_repair(client, auth)["run_id"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        replies = list(pool.map(lambda _: client.post(
+            "/api/repair/decide", headers=auth, json={"run_id": run_id, "decision": "approve"},
+        ), range(2)))
+    assert sorted(response.status_code for response in replies) == [200, 409]
+    assert [event["status"] for event in client.get("/api/repair").json()["run"]["audit"]].count("verified") == 1
+
+
+def test_repair_fails_closed_before_update(client, monkeypatch):
+    auth = login(client)
+    run_id = prepare_repair(client, auth)["run_id"]
+    traced = []
+    client.portal.call(lambda: current_repair().db.set_trace_callback(traced.append))
+
+    def unavailable(_run):
+        raise sqlite3.OperationalError("private diagnostic")
+
+    monkeypatch.setattr(repair.Run, "job_is_disabled", unavailable)
+    result = repair_step(client, auth, "decide", run_id=run_id, decision="approve")
+    assert result["status"] == "repair-failed"
+    failure = result["audit"][-1]["evidence"]
+    assert failure["phase"] == "before-update"
+    assert failure["attempted_rows_updated"] is None and not failure["committed"]
+    assert not any(statement.startswith("UPDATE") for statement in traced)
+    assert "private diagnostic" not in str(result)
+
+
+def test_failed_rerun_rolls_back_an_actual_update(client, monkeypatch):
+    auth = login(client)
+    run_id = prepare_repair(client, auth)["run_id"]
+    measure = repair.Run.measure
+
+    def failed_rerun(run):
+        assert measure(run) == {"status": "passed", "rows_returned": 1}
+        raise sqlite3.OperationalError("rerun interrupted")
+
+    monkeypatch.setattr(repair.Run, "measure", failed_rerun)
+    result = repair_step(client, auth, "decide", run_id=run_id, decision="approve")
+    assert result["status"] == "repair-failed"
+    failure = result["audit"][-1]["evidence"]
+    assert failure["phase"] == "verification" and failure["attempted_rows_updated"] == 1
+    assert failure["after"] is None and not failure["committed"]
+    assert client.portal.call(lambda: measure(current_repair())) == result["before"]
+    assert client.post("/api/repair/decide", headers=auth,
+                       json={"run_id": run_id, "decision": "approve"}).status_code == 409
+
+
+@pytest.mark.parametrize("body", [
+    {"job_id": "1; DROP TABLE repair_jobs"}, {"job_id": 21}, {"job_id": 0},
+    {"job_id": True}, {"job_id": 7.0}, {"job_id": 7, "sql": "UPDATE customers SET plan='free'"},
+])
+def test_repair_rejects_inputs_outside_the_catalog(client, body):
+    auth = login(client)
+    assert client.post("/api/repair/start", headers=auth, json=body).status_code == 400
+    assert client.get("/api/repair").json() == {"run": None}
+
+
+def test_repair_requires_auth_origin_and_csrf_and_rejects_forged_evidence(client):
+    assert client.get("/api/repair").status_code == 401
+    auth = login(client)
+    assert client.post("/api/repair/start", json={"job_id": 7}).status_code == 403
+    wrong_origin = {**auth, "Origin": "https://other.example"}
+    assert client.post("/api/repair/start", headers=wrong_origin, json={"job_id": 7}).status_code == 403
+    run = prepare_repair(client, auth)
+    forged = {"run_id": run["run_id"], "decision": "approve", "actor": "judge", "status": "verified"}
+    assert client.post("/api/repair/decide", headers=auth, json=forged).status_code == 400
+    assert client.get("/api/repair").json()["run"] == run
+    for _ in range(45 - len(current_repair_session(client).requests)):
+        assert client.get("/api/repair").status_code == 200
+    assert client.get("/api/repair").status_code == 429
+
+
+def test_isolated_proxy_requires_token_origin_and_csrf(client, monkeypatch):
+    monkeypatch.setenv("VEYLIX_ISOLATED", "1")
+    monkeypatch.setenv("VEYLIX_JUDGE_ORIGIN", "https://backend.example")
+    body = {"access_code": CODE}
+    assert client.post("/session", json=body, headers={"X-Gate-Proxy-Token": ""}).status_code == 403
+    assert client.post("/session", json=body, headers={"X-Gate-Proxy-Token": "wrong"}).status_code == 403
+    assert client.post("/session", json=body, headers={"Origin": "https://other.example"}).status_code == 403
+    assert client.post("/session", json=body, headers={"Host": "other.example"}).status_code == 403
+    assert client.post("/session", json=body, headers={
+        "Origin": "https://backend.example", "X-Gate-Proxy-Token": "",
+    }).status_code == 201
+
+    auth = login(client)
+    assert client.get("/api/repair").json() == {"run": None}
+    assert client.post("/logout", json={}).status_code == 403
+    assert client.post("/logout", json={}, headers={**auth, "X-Gate-Proxy-Token": ""}).status_code == 403
+    assert client.post("/action", json={}, headers=auth).status_code == 403
+    assert client.post("/logout", json={}, headers=auth).status_code == 200
+
+
+def current_repair_session(client):
+    return app.app.state.sessions.active[client.cookies.get(app.SECURE_COOKIE)]
+
+
+def test_repair_session_isolation_and_expiry(client, monkeypatch):
+    first_auth = login(client)
+    first = prepare_repair(client, first_auth)
+    first_cookie = client.cookies.get(app.SECURE_COOKIE)
+    client.cookies.clear()
+    second_auth = login(client)
+    assert client.get("/api/repair").json() == {"run": None}
+    second = prepare_repair(client, second_auth)
+    assert second["audit"][0]["actor"] != first["audit"][0]["actor"]
+    foreign = {"run_id": first["run_id"], "decision": "approve"}
+    assert client.post("/api/repair/decide", headers=second_auth, json=foreign).status_code == 404
+    assert client.get("/api/repair").json()["run"] == second
+    assert client.get("/api/repair", headers={"Cookie": f"{app.SECURE_COOKIE}={first_cookie}"}).json()["run"] == first
+
+    second_db = current_repair_session(client).repair_run.db
+    now = app.monotonic()
+    monkeypatch.setattr(app, "monotonic", lambda: now + app.SESSION_TTL)
+    assert client.get("/api/repair").status_code == 401
+    assert client.post("/api/repair/decide", headers=second_auth, json={
+        "run_id": second["run_id"], "decision": "approve",
+    }).status_code == 401
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        client.portal.call(second_db.execute, "SELECT 1")
