@@ -129,6 +129,7 @@ async def guard(request: Request, call_next):
     proxy_token = os.environ.get("GATE_PROXY_TOKEN", "")
     local = local_request(request)
     proxied = len(proxy_token) >= 32 and matches(request.headers.get("x-gate-proxy-token", ""), proxy_token)
+    request.state.proxied = proxied
     if isolated.enabled():
         request.state.local = False
         if request.url.path == "/healthz" or (judge_request(request) and request.url.path in JUDGE_PATHS):
@@ -158,7 +159,7 @@ def require_origin(request: Request):
         else os.environ.get("GATE_ALLOWED_ORIGINS", "").split(",")
     )
     if isolated.enabled():
-        configured = [judge_origin()]
+        configured = [judge_origin(), *configured] if request.state.proxied else [judge_origin()]
     origin = request.headers.get("origin")
     if not origin or origin not in configured or (not request.state.local and not origin.startswith("https://")):
         raise HTTPException(403, "Origin not allowed")

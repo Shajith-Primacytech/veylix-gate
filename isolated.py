@@ -88,6 +88,7 @@ class Run:
             "operation": "enable_sample_job",
             "diagnosis": "The sample job is disabled, so the workload returns zero rows.",
             "sql": UPDATE, "parameters": [self.job_id], "expected_rows_updated": 1,
+            "expected_after": PASSED,
             "expected_after": PASSED, "approval_window_seconds": APPROVAL_TTL,
         }
         self.approval_deadline = monotonic() + APPROVAL_TTL

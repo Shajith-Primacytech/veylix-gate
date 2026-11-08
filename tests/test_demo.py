@@ -311,6 +311,7 @@ def test_isolated_repair_proposal(client, monkeypatch, caplog, http_status, fini
         assert run["plan"]["operation"] == "enable_sample_job"
         assert run["plan"]["sql"] == repair.UPDATE
         assert run["plan"]["parameters"] == [7]
+        assert run["plan"]["expected_after"] == {"status": "passed", "rows_returned": 1}
         assert run["audit"][-1]["evidence"]["inference"] == {
             "provider": "Vultr Serverless Inference", "completion_id": "repair-completion", "model": "glm-5.3",
         }
@@ -475,6 +476,26 @@ def test_repair_requires_auth_origin_and_csrf_and_rejects_forged_evidence(client
     for _ in range(45 - len(current_repair_session(client).requests)):
         assert client.get("/api/repair").status_code == 200
     assert client.get("/api/repair").status_code == 429
+
+
+def test_isolated_proxy_requires_token_origin_and_csrf(client, monkeypatch):
+    monkeypatch.setenv("VEYLIX_ISOLATED", "1")
+    monkeypatch.setenv("VEYLIX_JUDGE_ORIGIN", "https://backend.example")
+    body = {"access_code": CODE}
+    assert client.post("/session", json=body, headers={"X-Gate-Proxy-Token": ""}).status_code == 403
+    assert client.post("/session", json=body, headers={"X-Gate-Proxy-Token": "wrong"}).status_code == 403
+    assert client.post("/session", json=body, headers={"Origin": "https://other.example"}).status_code == 403
+    assert client.post("/session", json=body, headers={"Host": "other.example"}).status_code == 403
+    assert client.post("/session", json=body, headers={
+        "Origin": "https://backend.example", "X-Gate-Proxy-Token": "",
+    }).status_code == 201
+
+    auth = login(client)
+    assert client.get("/api/repair").json() == {"run": None}
+    assert client.post("/logout", json={}).status_code == 403
+    assert client.post("/logout", json={}, headers={**auth, "X-Gate-Proxy-Token": ""}).status_code == 403
+    assert client.post("/action", json={}, headers=auth).status_code == 403
+    assert client.post("/logout", json={}, headers=auth).status_code == 200
 
 
 def current_repair_session(client):
