@@ -1,5 +1,7 @@
 import re
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 import httpx
 import pytest
@@ -7,6 +9,7 @@ from fastapi.testclient import TestClient
 
 import agent
 import app
+import repair
 
 ORIGIN = "https://demo.example"
 TOKEN = "test-gateway-token-" * 3
@@ -238,3 +241,189 @@ def test_legacy_form_fix(monkeypatch):
         assert local.post(f"/reject/{report['pending_id']}", data={"csrf": csrf},
                           follow_redirects=False).status_code == 303
         assert "rejected" in local.get("/").text
+
+
+def repair_step(client, auth, step, **body):
+    response = client.post(f"/api/repair/{step}", headers=auth, json=body)
+    assert response.status_code == 200, response.text
+    return response.json()["run"]
+
+
+def prepare_repair(client, auth, job_id=7):
+    run = repair_step(client, auth, "start", job_id=job_id)
+    return repair_step(client, auth, "diagnose", run_id=run["run_id"])
+
+
+def current_repair():
+    return next(iter(app.app.state.sessions.active.values())).repair_run
+
+
+def test_repair_measures_before_and_after_and_records_server_evidence(client):
+    auth = login(client)
+    assert client.get("/api/repair").json() == {"run": None}
+    started = repair_step(client, auth, "start", job_id=17)
+    run_id = started["run_id"]
+    assert started["status"] == "failure-observed"
+    assert started["before"] == {"status": "failed", "rows_returned": 0}
+    assert started["plan"] is None
+    assert client.post("/api/repair/decide", headers=auth,
+                       json={"run_id": run_id, "decision": "approve"}).status_code == 409
+    assert client.post("/api/repair/start", headers=auth, json={"job_id": 3}).status_code == 409
+    diagnosed = repair_step(client, auth, "diagnose", run_id=run_id)
+    assert diagnosed["status"] == "awaiting-approval"
+    assert diagnosed["plan"]["sql"] == repair.UPDATE
+    assert diagnosed["plan"]["parameters"] == [17]
+    assert diagnosed["plan"]["expected_rows_updated"] == 1
+    assert client.portal.call(lambda: current_repair().measure()) == started["before"]
+
+    approved = repair_step(client, auth, "decide", run_id=run_id, decision="approve")
+    assert approved["status"] == "verified"
+    events = approved["audit"]
+    assert [event["status"] for event in events] == [
+        "failure-observed", "awaiting-approval", "approved", "verified",
+    ]
+    assert events[2]["evidence"]["plan"] == diagnosed["plan"]
+    assert events[3]["evidence"] == {
+        "rows_updated": 1, "before": {"status": "failed", "rows_returned": 0},
+        "after": {"status": "passed", "rows_returned": 1}, "committed": True,
+    }
+    assert client.portal.call(lambda: current_repair().measure()) == events[3]["evidence"]["after"]
+    assert len({event["event_id"] for event in events}) == 4
+    assert len({event["actor"] for event in events}) == 1
+    assert all(event["run_id"] == run_id and event["mode"] == "sqlite-fixture" for event in events)
+    times = [datetime.fromisoformat(event["ts"]) for event in events]
+    assert all(t.utcoffset().total_seconds() == 0 for t in times)
+    assert times == sorted(times)
+    readback = client.get("/api/repair")
+    assert readback.json()["run"] == approved
+    for secret in (CODE, TOKEN, auth["X-CSRF-Token"], client.cookies.get(app.SECURE_COOKIE)):
+        assert secret not in readback.text
+
+
+def test_repair_rejection_and_superseded_run(client):
+    auth = login(client)
+    run_id = prepare_repair(client, auth)["run_id"]
+    rejected = repair_step(client, auth, "decide", run_id=run_id, decision="reject")
+    assert rejected["status"] == "rejected"
+    assert rejected["audit"][-1]["evidence"] == {"rows_updated": 0}
+    assert client.portal.call(lambda: current_repair().measure()) == rejected["before"]
+    payload = {"run_id": run_id, "decision": "approve"}
+    assert client.post("/api/repair/decide", headers=auth, json=payload).status_code == 409
+    fresh = prepare_repair(client, auth, job_id=8)
+    assert fresh["run_id"] != run_id
+    assert client.post("/api/repair/decide", headers=auth, json=payload).status_code == 404
+    assert client.get("/api/repair").json()["run"] == fresh
+
+
+def test_repair_approval_expires_without_execution(client, monkeypatch):
+    auth = login(client)
+    run = prepare_repair(client, auth)
+    monkeypatch.setattr(repair, "monotonic", lambda: current_repair().approval_deadline)
+    stale = repair_step(client, auth, "decide", run_id=run["run_id"], decision="approve")
+    assert stale["status"] == "stale"
+    assert [event["status"] for event in stale["audit"]] == ["failure-observed", "awaiting-approval", "stale"]
+    assert client.portal.call(lambda: current_repair().measure()) == stale["before"]
+
+
+def test_repair_execution_is_single_use_under_concurrency(client):
+    auth = login(client)
+    run_id = prepare_repair(client, auth)["run_id"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        replies = list(pool.map(lambda _: client.post(
+            "/api/repair/decide", headers=auth, json={"run_id": run_id, "decision": "approve"},
+        ), range(2)))
+    assert sorted(response.status_code for response in replies) == [200, 409]
+    assert [event["status"] for event in client.get("/api/repair").json()["run"]["audit"]].count("verified") == 1
+
+
+def test_repair_fails_closed_before_update(client, monkeypatch):
+    auth = login(client)
+    run_id = prepare_repair(client, auth)["run_id"]
+    traced = []
+    client.portal.call(lambda: current_repair().db.set_trace_callback(traced.append))
+
+    def unavailable(_run):
+        raise sqlite3.OperationalError("private diagnostic")
+
+    monkeypatch.setattr(repair.Run, "job_is_disabled", unavailable)
+    result = repair_step(client, auth, "decide", run_id=run_id, decision="approve")
+    assert result["status"] == "repair-failed"
+    failure = result["audit"][-1]["evidence"]
+    assert failure["phase"] == "before-update"
+    assert failure["attempted_rows_updated"] is None and not failure["committed"]
+    assert not any(statement.startswith("UPDATE") for statement in traced)
+    assert "private diagnostic" not in str(result)
+
+
+def test_failed_rerun_rolls_back_an_actual_update(client, monkeypatch):
+    auth = login(client)
+    run_id = prepare_repair(client, auth)["run_id"]
+    measure = repair.Run.measure
+
+    def failed_rerun(run):
+        assert measure(run) == {"status": "passed", "rows_returned": 1}
+        raise sqlite3.OperationalError("rerun interrupted")
+
+    monkeypatch.setattr(repair.Run, "measure", failed_rerun)
+    result = repair_step(client, auth, "decide", run_id=run_id, decision="approve")
+    assert result["status"] == "repair-failed"
+    failure = result["audit"][-1]["evidence"]
+    assert failure["phase"] == "verification" and failure["attempted_rows_updated"] == 1
+    assert failure["after"] is None and not failure["committed"]
+    assert client.portal.call(lambda: measure(current_repair())) == result["before"]
+    assert client.post("/api/repair/decide", headers=auth,
+                       json={"run_id": run_id, "decision": "approve"}).status_code == 409
+
+
+@pytest.mark.parametrize("body", [
+    {"job_id": "1; DROP TABLE repair_jobs"}, {"job_id": 21}, {"job_id": 0},
+    {"job_id": True}, {"job_id": 7.0}, {"job_id": 7, "sql": "UPDATE customers SET plan='free'"},
+])
+def test_repair_rejects_inputs_outside_the_catalog(client, body):
+    auth = login(client)
+    assert client.post("/api/repair/start", headers=auth, json=body).status_code == 400
+    assert client.get("/api/repair").json() == {"run": None}
+
+
+def test_repair_requires_auth_origin_and_csrf_and_rejects_forged_evidence(client):
+    assert client.get("/api/repair").status_code == 401
+    auth = login(client)
+    assert client.post("/api/repair/start", json={"job_id": 7}).status_code == 403
+    wrong_origin = {**auth, "Origin": "https://other.example"}
+    assert client.post("/api/repair/start", headers=wrong_origin, json={"job_id": 7}).status_code == 403
+    run = prepare_repair(client, auth)
+    forged = {"run_id": run["run_id"], "decision": "approve", "actor": "judge", "status": "verified"}
+    assert client.post("/api/repair/decide", headers=auth, json=forged).status_code == 400
+    assert client.get("/api/repair").json()["run"] == run
+    for _ in range(45 - len(current_repair_session(client).requests)):
+        assert client.get("/api/repair").status_code == 200
+    assert client.get("/api/repair").status_code == 429
+
+
+def current_repair_session(client):
+    return app.app.state.sessions.active[client.cookies.get(app.SECURE_COOKIE)]
+
+
+def test_repair_session_isolation_and_expiry(client, monkeypatch):
+    first_auth = login(client)
+    first = prepare_repair(client, first_auth)
+    first_cookie = client.cookies.get(app.SECURE_COOKIE)
+    client.cookies.clear()
+    second_auth = login(client)
+    assert client.get("/api/repair").json() == {"run": None}
+    second = prepare_repair(client, second_auth)
+    assert second["audit"][0]["actor"] != first["audit"][0]["actor"]
+    foreign = {"run_id": first["run_id"], "decision": "approve"}
+    assert client.post("/api/repair/decide", headers=second_auth, json=foreign).status_code == 404
+    assert client.get("/api/repair").json()["run"] == second
+    assert client.get("/api/repair", headers={"Cookie": f"{app.SECURE_COOKIE}={first_cookie}"}).json()["run"] == first
+
+    second_db = current_repair_session(client).repair_run.db
+    now = app.monotonic()
+    monkeypatch.setattr(app, "monotonic", lambda: now + app.SESSION_TTL)
+    assert client.get("/api/repair").status_code == 401
+    assert client.post("/api/repair/decide", headers=second_auth, json={
+        "run_id": second["run_id"], "decision": "approve",
+    }).status_code == 401
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        client.portal.call(second_db.execute, "SELECT 1")

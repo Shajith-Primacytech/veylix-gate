@@ -12,7 +12,19 @@ Each authenticated session starts with 250 fictional customers, 1,200 orders, an
 | Allowlisted destructive shell or cloud scenario | Reports mock impact and waits for review |
 | Unknown shell or SQL syntax, multiple statements, unsupported SQL functions or tables | Blocks without an approval option |
 
-Approve records a simulated outcome. Reject records a block. Both consume the pending item, and a fixture change invalidates earlier approval reports. Shell and cloud commands are simulated. The demo has no shell executor, cloud mutation credentials, or production database connection. A Docker service hosts the API. Shell sandbox isolation is outside this demo.
+In the existing scenario picker, approving a pending action records a simulated outcome. Rejecting it records a block. Both consume the pending item, and a fixture change invalidates earlier approval reports. Shell and cloud commands are simulated. The demo has no shell executor, cloud mutation credentials, or production database connection. A Docker service hosts the API.
+
+## Judge walkthrough
+
+1. On the approved Vercel Preview, select **Try a Live Repair** and enter the demo access code provided by the organizer.
+2. Choose a sample job from 1 through 20 and select **Create and run broken sample**. The backend seeds a private in-memory SQLite database and actually runs the sample query. The disabled job returns zero rows.
+3. Select **Request diagnosis**. Review the exact parameterized UPDATE, its bound job ID, and the expected one-row effect. Review expires after five minutes.
+4. Select **Approve and rerun**. The backend applies the one-row UPDATE, reruns the same SELECT, and commits only if both measured results match the plan. Expect **Repair verified and committed**, with zero rows before, one row after, and one row updated. To see the reject path, create another sample workload and reject its plan. Rejection leaves the sample job disabled.
+5. Open the server audit timeline and download the redacted JSON before replacing the run or ending the session. It includes UTC timestamps, server-generated event and run IDs, a pseudonymous session actor, the plan, the measured result, and the `sqlite-fixture` mode. The export is an unsigned snapshot of the server's session record and omits credentials and cookies.
+
+This is a real SQL repair of sample data in a session-scoped SQLite fixture. Shell and cloud scenarios are simulations. The guided workflow uses a fixed SQL catalog, one current run per session, the existing session, Origin and CSRF checks, and the existing request limits. It needs the updated API on the isolated staging VM and the updated frontend on Vercel Preview with the staging gateway URL, matching gateway token, and the exact Preview origin on the API allowlist. No inference key or OS runner is needed for the guided workflow.
+
+**Judge launch gate:** NO-GO until the walkthrough succeeds on the actual Preview URL connected to the isolated staging backend. Confirm that a second browser session cannot read or approve the first run, and that the downloaded evidence matches the server timeline. Local tests and a local build alone do not clear this gate.
 
 ## Local checks
 

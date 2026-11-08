@@ -4,6 +4,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 from collections import deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from fastapi.templating import Jinja2Templates
 import agent
 import database
 import gate
+import repair
 
 SESSION_TTL = 30 * 60
 MAX_SESSIONS = 64
@@ -34,6 +36,8 @@ class Session:
     demo: gate.Demo = field(default_factory=gate.Demo)
     requests: deque = field(default_factory=deque)
     inference: deque = field(default_factory=deque)
+    repair_actor: str = field(default_factory=lambda: secrets.token_hex(16))
+    repair_run: repair.Run | None = None
 
 
 class Sessions:
@@ -45,7 +49,10 @@ class Sessions:
         self.inflight_inference = 0
 
     def discard(self, sid: str):
-        self.active.pop(sid).demo.db.close()
+        session = self.active.pop(sid)
+        session.demo.db.close()
+        if session.repair_run is not None:
+            session.repair_run.db.close()
 
     def expire(self):
         for sid, session in list(self.active.items()):
@@ -315,6 +322,66 @@ async def api_pending(request: Request):
 @app.get("/api/audit")
 async def api_audit(request: Request):
     return {"audit": list(require_session(request).demo.audit)}
+
+
+@app.get("/api/repair")
+async def repair_status(request: Request):
+    run = require_session(request).repair_run
+    return {"run": run.summary() if run else None}
+
+
+@app.post("/api/repair/start")
+async def repair_start(request: Request):
+    session, data = await mutation(request)
+    job_id = data.get("job_id")
+    if data.keys() != {"job_id"} or type(job_id) is not int or not 1 <= job_id <= repair.MAX_JOB_ID:
+        raise HTTPException(400, "Choose a sample job from 1 through 20")
+    previous = session.repair_run
+    if previous is not None and previous.status not in repair.TERMINAL:
+        raise HTTPException(409, "Finish reviewing the current workload first")
+    try:
+        run = repair.Run(job_id, session.repair_actor)
+    except sqlite3.Error:
+        raise HTTPException(503, "The sample failure could not be verified") from None
+    session.repair_run = run
+    if previous is not None:
+        previous.db.close()
+    return {"run": run.summary()}
+
+
+def reviewable_run(session: Session, data: dict, expected_status: str) -> repair.Run:
+    run_id = data.get("run_id")
+    run = session.repair_run
+    if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        raise HTTPException(400, "Invalid repair run ID")
+    if run is None or run.id != run_id:
+        raise HTTPException(404, "Repair run not found")
+    if run.status != expected_status:
+        raise HTTPException(409, "This repair step is no longer available")
+    return run
+
+
+@app.post("/api/repair/diagnose")
+async def repair_diagnose(request: Request):
+    session, data = await mutation(request)
+    if data.keys() != {"run_id"}:
+        raise HTTPException(400, "Send only the repair run ID")
+    run = reviewable_run(session, data, "failure-observed")
+    try:
+        run.diagnose()
+    except sqlite3.Error:
+        run.record("repair-failed", {"phase": "diagnosis", "committed": False})
+    return {"run": run.summary()}
+
+
+@app.post("/api/repair/decide")
+async def repair_decide(request: Request):
+    session, data = await mutation(request)
+    if data.keys() != {"run_id", "decision"} or data.get("decision") not in ("approve", "reject"):
+        raise HTTPException(400, "Choose approve or reject for the repair run")
+    run = reviewable_run(session, data, "awaiting-approval")
+    run.decide(data["decision"] == "approve")
+    return {"run": run.summary()}
 
 
 @app.get("/healthz")

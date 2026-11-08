@@ -5,6 +5,18 @@
 
 [hidden]{display:none!important}.session-form{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0}.session-form input{flex:1;min-width:12rem;background:#090d1c;color:inherit;border:1px solid #ffffff36;border-radius:10px;padding:11px;font:inherit}.session-form button,.actionbar button{white-space:normal}.btn:disabled{opacity:.55;cursor:default}.review pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:18rem;overflow:auto}.pending-card{border-top:1px solid #ffffff24;margin-top:12px;padding-top:12px}.outcome,.impact strong,.pending-card code,.event small{overflow-wrap:anywhere}.report-details{margin:10px 0;color:#c2bed0}.report-details summary{cursor:pointer}
  .brand-symbol{flex:none;display:block;overflow:visible;filter:drop-shadow(0 2px 9px #7658eb44)}.brand-wordmark{display:block;line-height:1.28;white-space:nowrap}.brand-accent{color:#b5a0ff}@media(max-width:520px){.brand-symbol{width:39px;height:39px}.logo{gap:8px;font-size:16px}.brand-wordmark .small{font-size:10px}}
+.repair-lab{margin:22px 0;padding:clamp(14px,3vw,24px);background:#141a34;border:1px solid #625487;border-radius:15px;scroll-margin-top:16px}
+.repair-lab h3,.repair-lab h4{margin:0 0 8px}
+.repair-labels{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,12rem),1fr));gap:10px;margin:16px 0}
+.repair-labels p{margin:0;padding:12px;background:#1c2848;border-radius:9px;color:#bdc9e8;font-size:13px}
+.repair-labels strong{display:block;color:#eee7ff;margin-bottom:4px}
+.repair-lab .session-form input{flex:0 1 5rem;min-width:4rem}
+.repair-lab .decisions{flex-wrap:wrap;margin:12px 0}
+.repair-lab pre{white-space:pre-wrap;overflow-wrap:anywhere}
+.repair-lab .history{padding:0}
+.repair-lab .event{display:block}
+.repair-lab .event .report-details{margin-bottom:0}
+.repair-error{color:#ffd0db}
 </style></head>
 <body><div class="wrap"><header class="top"><div class="logo" aria-label="Veylix Gate">
 <svg class="brand-symbol" viewBox="0 0 64 64" width="50" height="50" role="img" aria-label="Veylix code repair logo" xmlns="http://www.w3.org/2000/svg">
@@ -15,12 +27,31 @@
 <path d="m34 8 2.5 5.5L42 16l-5.5 2.5L34 24l-2.5-5.5L26 16l5.5-2.5Z" fill="#cbb9ff"/>
 </svg>
 <span class="brand-wordmark"><span>Veylix <span class="brand-accent">Gate</span></span><span class="small muted" style="display:block;font-weight:400">AI Agent Safety Control</span></span></div><div style="display:flex;gap:9px;align-items:center"><span class="demo-badge">AUTHENTICATED DEMO</span><span class="status" id="demoStatus">Sign-in required</span></div></header>
-<section class="hero"><div><span class="eyebrow">For startup engineering teams and indie developers</span><h1>Ship faster with AI.<br><em>Without handing it the delete button.</em></h1><p>AI coding agents can touch your database, files and cloud. Veylix shows the blast radius of risky actions and puts humans in control of destructive changes.</p><button class="btn" id="heroDemo">▶ Try the 60-second safety demo</button></div><div class="shield" aria-hidden="true">🛡️</div></section>
-<section class="stats" aria-label="Fictional sample resources"><div class="stat"><strong>250</strong><span>Fictional customer records</span></div><div class="stat"><strong>1,200</strong><span>Fictional orders</span></div><div class="stat"><strong>2</strong><span>Mock storage volumes</span></div><div class="stat"><strong>0</strong><span>Real systems connected</span></div></section>
+<section class="hero"><div><span class="eyebrow">For startup engineering teams and indie developers</span><h1>Ship faster with AI.<br><em>Without handing it the delete button.</em></h1><p>AI coding agents can touch your database, files and cloud. Veylix shows the blast radius of risky actions and puts humans in control of destructive changes.</p><button class="btn" id="heroDemo" type="button">Try a Live Repair</button></div><div class="shield" aria-hidden="true">🛡️</div></section>
+<section class="stats" aria-label="Fictional sample resources"><div class="stat"><strong>250</strong><span>Fictional customer records</span></div><div class="stat"><strong>1,200</strong><span>Fictional orders</span></div><div class="stat"><strong>2</strong><span>Mock storage volumes</span></div><div class="stat"><strong>0</strong><span>Production workloads touched</span></div></section>
 <section class="panel" id="demo"><div class="head"><div><h2>Watch the gate in action</h2><p>Choose an agent action. See what Veylix would allow, review or stop.</p></div><span class="demo-badge">DISPOSABLE DEMO DATA</span></div><div class="steps"><div class="step"><b>01 / Agent</b>Proposes action</div><div class="step"><b>02 / Gate</b>Checks impact</div><div class="step"><b>03 / Human</b>Reviews risk</div><div class="step"><b>04 / Outcome</b>Action recorded</div></div>
 
 <form class="session-form" id="signin"><label for="accessCode">Demo access code</label><input type="password" id="accessCode" maxlength="256" required autocomplete="current-password"><button class="btn" type="submit">Start demo session</button></form>
 <button class="btn secondary" type="button" id="signout" hidden>End session</button>
+<section class="repair-lab" id="repair" aria-labelledby="repairTitle">
+  <h3 id="repairTitle" tabindex="-1">Repair a disabled sample job</h3>
+  <div class="repair-labels">
+    <p><strong>Sample data</strong>Choose a fictional job numbered 1 through 20.</p>
+    <p><strong>Executed in isolated demo environment</strong>SQLite runs in memory for this session. The backend measures the workload before and after the approved repair.</p>
+    <p><strong>Simulated only</strong>The shell and cloud scenarios below are simulations.</p>
+  </div>
+  <p id="repairSignin" class="muted">Start a demo session above to create a sample failure.</p>
+  <div id="repairSession" hidden>
+    <form class="session-form" id="repairStart" hidden>
+      <label for="repairJob">Sample job number</label>
+      <input id="repairJob" type="number" min="1" max="20" step="1" value="7" required>
+      <button class="btn" type="submit">Create and run broken sample</button>
+    </form>
+    <p id="repairError" class="repair-error" role="alert" hidden></p>
+    <div id="repairReport"></div>
+    <button class="btn secondary" type="button" id="repairRefresh">Refresh repair status</button>
+  </div>
+</section>
 <div class="scenarios" id="scenarioList"><button type="button" class="scenario" data-i="0"><span class="ico">🔍</span><b>Read customer data</b><small>A safe SELECT query shouldn't interrupt a developer.</small></button><button type="button" class="scenario active" data-i="1"><span class="ico">⚠️</span><b>Drop customer table</b><small>The agent proposes a destructive schema cleanup.</small></button><button type="button" class="scenario" data-i="2"><span class="ico">💽</span><b>Delete production volume</b><small>The agent targets a mock volume labeled production.</small></button><button type="button" class="scenario" data-i="3"><span class="ico">✎</span><b>Update one customer</b><small>A primary-key filter limits the change to one fixture.</small></button></div>
 <form class="session-form" id="inference" hidden><label for="task">Ask Vultr Serverless Inference</label><input id="task" maxlength="1000" placeholder="Count the demo customers" required><button class="btn secondary" type="submit">Propose an action</button></form>
 <div class="actionbar"><div class="command" id="command">DROP TABLE customers;</div><button class="btn" id="run" disabled>Analyze proposed action</button></div><div class="review" id="review" aria-live="polite"></div><div class="outcome" id="outcome" aria-live="polite"></div></section>

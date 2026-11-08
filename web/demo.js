@@ -21,10 +21,10 @@ function element(tag, content, className) {
   return node;
 }
 
-function button(label, style, handler) {
+function button(label, style, handler, onError) {
   const control = element("button", label, style);
   control.type = "button";
-  control.addEventListener("click", () => work(handler));
+  control.addEventListener("click", () => work(handler, onError));
   return control;
 }
 
@@ -48,8 +48,14 @@ function setSession(token) {
   $("signout").hidden = !token;
   $("inference").hidden = !token;
   $("run").disabled = !token;
+  $("repairSignin").hidden = Boolean(token);
+  $("repairSession").hidden = !token;
   $("demoStatus").textContent = token ? "Demo session active" : "Sign-in required";
   if (!token) {
+    $("repairStart").hidden = true;
+    $("repairError").hidden = true;
+    $("repairError").textContent = "";
+    $("repairReport").replaceChildren();
     review.replaceChildren();
     review.classList.remove("visible");
     history.replaceChildren(element("p", "Sign in to see session activity.", "muted"));
@@ -74,7 +80,7 @@ async function api(route, body) {
   return result;
 }
 
-async function work(handler) {
+async function work(handler, onError = message) {
   if (busy) return;
   busy = true;
   $("demo").setAttribute("aria-busy", "true");
@@ -82,7 +88,7 @@ async function work(handler) {
   try {
     await handler();
   } catch (error) {
-    message(error.message);
+    onError(error.message);
   } finally {
     busy = false;
     $("demo").setAttribute("aria-busy", "false");
@@ -93,6 +99,93 @@ function details(label, value) {
   const panel = element("details", "", "report-details");
   panel.append(element("summary", label), element("pre", JSON.stringify(value, null, 2)));
   return panel;
+}
+
+const repairStatuses = {
+  "failure-observed": "Failure reproduced",
+  "awaiting-approval": "Awaiting your decision",
+  approved: "Repair approved",
+  rejected: "Repair rejected. No update ran.",
+  verified: "Repair verified and committed",
+  stale: "Review is stale. No repair was committed.",
+  "repair-failed": "Repair could not be verified. No repair was committed.",
+};
+
+function repairError(text) {
+  $("repairError").textContent = text;
+  $("repairError").hidden = !text;
+}
+
+function downloadEvidence(run) {
+  // The backend summary is limited to fixture evidence and a pseudonymous actor ID.
+  const blob = new Blob([JSON.stringify(run, null, 2) + "\n"], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = element("a", "");
+  link.href = url;
+  link.download = "veylix-repair-" + run.run_id + ".json";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function loadRepair(step, body) {
+  repairError("");
+  const { run } = await api("api/repair" + (step ? "/" + step : ""), body);
+  renderRepair(run);
+  if (step) $("repairResult").focus({ preventScroll: true });
+}
+
+function renderRepair(run) {
+  const panel = $("repairReport");
+  panel.replaceChildren();
+  $("repairStart").hidden = Boolean(run && ["failure-observed", "awaiting-approval"].includes(run.status));
+  if (!run) return;
+
+  const heading = element("h4", repairStatuses[run.status]);
+  heading.id = "repairResult";
+  heading.tabIndex = -1;
+  panel.append(heading, element("p", `Before · Sample job ${run.job_id} · ${run.before.rows_returned} rows returned`, "muted"));
+  const latest = run.audit.at(-1);
+  if (run.status === "verified") {
+    const measured = latest.evidence;
+    panel.append(element("p", `After · ${measured.after.rows_returned} row returned · ${measured.rows_updated} row updated`));
+  }
+  if (latest.evidence.reason) panel.append(element("p", latest.evidence.reason, "muted"));
+  if (run.plan) {
+    panel.append(
+      element("p", run.plan.diagnosis, "muted"),
+      element("pre", run.plan.sql, "command"),
+      element("p", `Bound job ID ${run.plan.parameters[0]} · Expected impact: ${run.plan.expected_rows_updated} row updated · Expected rerun: ${run.plan.expected_after.rows_returned} row returned`, "muted"),
+    );
+  }
+
+  const controls = element("div", "", "decisions");
+  const target = { run_id: run.run_id };
+  if (run.status === "failure-observed") {
+    controls.append(button("Request diagnosis", "btn", () => loadRepair("diagnose", target), repairError));
+  }
+  if (run.status === "awaiting-approval") {
+    panel.append(element("p", `This review is valid for ${run.plan.approval_window_seconds / 60} minutes after diagnosis.`, "muted"));
+    controls.append(
+      button("Reject repair", "reject", () => loadRepair("decide", { ...target, decision: "reject" }), repairError),
+      button("Approve and rerun", "approve", () => loadRepair("decide", { ...target, decision: "approve" }), repairError),
+    );
+  }
+  controls.append(button("Download redacted evidence", "btn secondary", () => downloadEvidence(run), repairError));
+  panel.append(controls, element("h4", "Server audit timeline"));
+  const timeline = element("ol", "", "history");
+  for (const event of run.audit) {
+    const row = element("li", "", "event");
+    row.append(
+      element("strong", repairStatuses[event.status] || event.status),
+      element("small", `${event.ts} · ${event.mode} · Event ${event.event_id}`),
+      element("small", `Demo session actor ${event.actor}`),
+      details("Event evidence", event.evidence),
+    );
+    timeline.append(row);
+  }
+  panel.append(timeline);
 }
 
 function renderImpact(report) {
@@ -180,9 +273,15 @@ document.querySelectorAll(".scenario").forEach((item) => {
   item.addEventListener("click", () => setScenario(Number(item.dataset.i)));
 });
 $("heroDemo").addEventListener("click", () => {
-  $("demo").scrollIntoView({ behavior: "smooth" });
-  (csrf ? $("run") : $("accessCode")).focus({ preventScroll: true });
+  const target = csrf ? $("repairTitle") : $("accessCode");
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  target.focus({ preventScroll: true });
 });
+$("repairStart").addEventListener("submit", (event) => {
+  event.preventDefault();
+  void work(() => loadRepair("start", { job_id: $("repairJob").valueAsNumber }), repairError);
+});
+$("repairRefresh").addEventListener("click", () => work(() => loadRepair(), repairError));
 $("run").addEventListener("click", () => work(async () => {
   const result = await api("action", scenarios[selected]);
   await refresh(result);
@@ -195,7 +294,7 @@ $("signin").addEventListener("submit", (event) => {
     input.value = "";
     const result = await api("session", { access_code: code });
     setSession(result.csrf);
-    await refresh();
+    await Promise.all([refresh(), loadRepair().catch((error) => repairError(error.message))]);
   });
 });
 $("signout").addEventListener("click", () => work(async () => {
@@ -215,5 +314,5 @@ setSession(undefined);
 setScenario(selected);
 void api("session").then((result) => {
   setSession(result.csrf);
-  return refresh();
+  return work(() => Promise.all([refresh(), loadRepair().catch((error) => repairError(error.message))]));
 }).catch(() => {});

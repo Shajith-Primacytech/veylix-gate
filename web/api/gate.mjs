@@ -1,5 +1,5 @@
-const readable = new Set(["session", "api/pending", "api/audit"]);
-const writable = new Set(["session", "logout", "action", "agent"]);
+const readable = new Set(["session", "api/pending", "api/audit", "api/repair"]);
+const writable = new Set(["session", "logout", "action", "agent", "api/repair/start", "api/repair/diagnose", "api/repair/decide"]);
 const maxBody = 8192;
 const noCache = {
   "Cache-Control": "no-store",
