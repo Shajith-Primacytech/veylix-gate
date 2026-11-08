@@ -39,6 +39,9 @@ class Run:
             raise
         self.record("failure-observed", {"workload": WORKLOAD, "parameters": [job_id], "result": self.before})
 
+    def close(self):
+        self.db.close()
+
     def measure(self) -> dict:
         found = self.db.execute(WORKLOAD, (self.job_id,)).fetchone()
         return {"status": "passed" if found else "failed", "rows_returned": int(found is not None)}

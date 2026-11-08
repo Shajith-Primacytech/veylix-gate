@@ -16,6 +16,30 @@ SYSTEM_PROMPT = (
 
 
 async def propose(task: str) -> tuple[dict, dict]:
+    return await completion(SYSTEM_PROMPT, task, legacy_proposal)
+
+
+async def propose_repair(job_id: int) -> dict:
+    _, evidence = await completion(
+        'Diagnose a disposable SQLite fixture. The selected row exists with enabled=0. '
+        'The workload selects the row only when enabled=1. Propose the narrow fix using '
+        'only this JSON shape: {"operation":"enable_sample_job"}. No SQL or shell.',
+        f"Job {job_id} returned zero rows; propose the narrow repair.",
+        lambda payload: payload == {"operation": "enable_sample_job"},
+    )
+    return evidence
+
+
+def legacy_proposal(payload):
+    return (
+        isinstance(payload, dict) and set(payload) == {"kind", "action"}
+        and payload["kind"] in ("sql", "shell") and isinstance(payload["action"], str)
+        and bool(payload["action"].strip()) and len(payload["action"]) <= MAX_ACTION
+        and bool(payload["action"].encode())
+    )
+
+
+async def completion(system, task, valid):
     key = os.environ.get("VULTR_INFERENCE_API_KEY")
     model = os.environ.get("VULTR_INFERENCE_MODEL")
     if not key or not model:
@@ -24,7 +48,7 @@ async def propose(task: str) -> tuple[dict, dict]:
         async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
             response = await client.post(URL, headers={"Authorization": f"Bearer {key}"}, json={
                 "model": model,
-                "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": task}],
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": task}],
                 "max_tokens": 256,
                 "temperature": 0.1,
             })
@@ -32,14 +56,11 @@ async def propose(task: str) -> tuple[dict, dict]:
         body = response.json()
         payload = json.loads(body["choices"][0]["message"]["content"])
         if (
-            not isinstance(payload, dict) or set(payload) != {"kind", "action"}
-            or payload["kind"] not in ("sql", "shell") or not isinstance(payload["action"], str)
-            or not payload["action"].strip() or len(payload["action"]) > MAX_ACTION
+            not valid(payload)
             or not isinstance(body["id"], str) or not body["id"].strip()
             or not isinstance(body["model"], str) or not body["model"].strip()
         ):
             raise ValueError()
-        payload["action"].encode()
         body["id"].encode()
         body["model"].encode()
     except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError, RecursionError):

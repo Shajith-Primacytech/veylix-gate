@@ -8,3 +8,6 @@
 !repair.py
 !templates/
 !templates/index.html
+!isolated.py
+!templates/judge.html
+!templates/judge.js
