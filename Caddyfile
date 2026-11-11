@@ -1,0 +1,4 @@
+https://{$GATE_BACKEND_HOST} {
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy gate:8000
+}

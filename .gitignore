@@ -7,3 +7,7 @@ data/*.db
 data/*.db-*
 *.log
 .DS_Store
+
+.env.*
+.vercel/
+.pytest_cache/

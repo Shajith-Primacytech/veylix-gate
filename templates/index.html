@@ -36,7 +36,7 @@
 <body>
   <header>
     <h1>🛡️ Veylix Gate <span class="mut">— blast-radius approvals for AI coding agents</span></h1>
-    <span class="mut">one VM · Vultr Serverless Inference · Docker sandbox</span>
+    <span class="mut">Disposable SQLite fixtures · Shell simulation</span>
   </header>
   <main>
     <section class="card">
@@ -50,7 +50,8 @@
 
     <section class="card">
       <h2>Try an action</h2>
-      <form method="post" action="/action" onsubmit="return submitJSON(this, 'actionOut')">
+      <form method="post" action="/action" onsubmit="submitJSON(event, this, 'actionOut'); return false;">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
         <select name="kind">
           <option value="sql">sql</option>
           <option value="shell">shell</option>
@@ -73,8 +74,8 @@
           <pre>{{ p.action }}</pre>
           <pre>{{ p.blast_radius }}</pre>
           <div class="actions">
-            <form method="post" action="/approve/{{ p.id }}"><button class="approve" type="submit">Approve &amp; run</button></form>
-            <form method="post" action="/reject/{{ p.id }}"><button class="reject" type="submit">Reject</button></form>
+            <form method="post" action="/approve/{{ p.id }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="approve" type="submit">Approve in demo</button></form>
+            <form method="post" action="/reject/{{ p.id }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="reject" type="submit">Reject</button></form>
           </div>
         </div>
       {% endfor %}
@@ -99,10 +100,10 @@
   </main>
 
 <script>
-async function submitJSON(form, outId){
-  event.preventDefault();
-  const fd = new FormData(form);
-  const r = await fetch(form.action, {method:'POST', body:fd});
+async function submitJSON(ev, form, outId){
+  ev.preventDefault();
+  const fd = new URLSearchParams(new FormData(form));
+  const r = await fetch(form.getAttribute("action"), {method:'POST', body:fd});
   const j = await r.json();
   document.getElementById(outId).textContent = JSON.stringify(j, null, 2);
   setTimeout(()=>location.reload(), 800);

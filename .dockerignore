@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!requirements.txt
+!app.py
+!agent.py
+!database.py
+!gate.py
+!templates/
+!templates/index.html

@@ -1,0 +1,17 @@
+services:
+  gate:
+    extends:
+      file: docker-compose.yml
+      service: gate
+  ngrok:
+    image: ngrok/ngrok:3@sha256:ff3b5c3674432d14a786349908b7bdf28ee56c25662637afcbe7180d471993ef
+    command:
+      - http
+      - http://gate:8000
+      - --url=https://${GATE_BACKEND_HOST:?Set the assigned ngrok hostname}
+      - --inspect=false
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:?Set the staging ngrok agent token}
+    depends_on:
+      - gate
+    restart: unless-stopped

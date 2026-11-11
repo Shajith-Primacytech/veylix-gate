@@ -1,53 +1,51 @@
-"""Thin agent loop over Vultr Serverless Inference (OpenAI-compatible)."""
+"""Vultr inference supplies a proposal. Only the gate can act on it."""
+import json
 import os
-from openai import OpenAI
 
-import gate
+import httpx
 
-SYSTEM_PROMPT = """You are an AI coding agent helping with a staging environment issue.
-When you decide to run something, respond with a single JSON object on one line:
-{"kind": "sql" | "shell", "action": "<the exact command or SQL>"}
-Do not run anything yourself. The gate runs it. Prefer the smallest action.
-"""
+from gate import MAX_ACTION
 
-
-def _client() -> OpenAI:
-    return OpenAI(
-        api_key=os.environ.get("VULTR_INFERENCE_API_KEY", "sk-no-key"),
-        base_url=os.environ.get("VULTR_INFERENCE_BASE_URL", "https://api.vultrinference.com/v1"),
-    )
+URL = "https://api.vultrinference.com/v1/chat/completions"
+SYSTEM_PROMPT = (
+    'Propose one action against disposable SQLite fixtures or simulated shell. '
+    'Return only a JSON object with keys "kind" ("sql" or "shell") and "action" (a string). '
+    'The SQLite fixture tables are customers, orders, and cloud_volumes. '
+    'Prefer a read. Never include credentials or tool calls.'
+)
 
 
-def ask_agent(user_task: str) -> dict:
-    """Ask the model for one action, run it through the gate."""
-    import json
+async def propose(task: str) -> tuple[dict, dict]:
+    key = os.environ.get("VULTR_INFERENCE_API_KEY")
+    model = os.environ.get("VULTR_INFERENCE_MODEL")
+    if not key or not model:
+        raise ValueError("Vultr Serverless Inference is not configured")
     try:
-        resp = _client().chat.completions.create(
-            model=os.environ.get("VULTR_INFERENCE_MODEL", "llama-3.3-70b-instruct"),
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_task},
-            ],
-            temperature=0.2,
-            max_tokens=200,
-        )
-        raw = resp.choices[0].message.content or ""
-    except Exception as e:
-        return {"ok": False, "error": f"inference call failed: {e}", "task": user_task}
-
-    import re
-    m = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not m:
-        return {"ok": False, "error": "model returned no JSON", "raw": raw}
-    try:
-        payload = json.loads(m.group(0))
-    except json.JSONDecodeError as e:
-        return {"ok": False, "error": f"bad JSON from model: {e}", "raw": raw}
-
-    kind = payload.get("kind")
-    action = payload.get("action")
-    if kind not in ("sql", "shell") or not action:
-        return {"ok": False, "error": "model gave invalid kind/action", "payload": payload}
-
-    gate_result = gate.decide_and_route(kind, action)
-    return {"ok": True, "agent_raw": raw, "proposed": payload, "gate": gate_result}
+        async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+            response = await client.post(URL, headers={"Authorization": f"Bearer {key}"}, json={
+                "model": model,
+                "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": task}],
+                "max_tokens": 256,
+                "temperature": 0.1,
+            })
+        response.raise_for_status()
+        body = response.json()
+        payload = json.loads(body["choices"][0]["message"]["content"])
+        if (
+            not isinstance(payload, dict) or set(payload) != {"kind", "action"}
+            or payload["kind"] not in ("sql", "shell") or not isinstance(payload["action"], str)
+            or not payload["action"].strip() or len(payload["action"]) > MAX_ACTION
+            or not isinstance(body["id"], str) or not body["id"].strip()
+            or not isinstance(body["model"], str) or not body["model"].strip()
+        ):
+            raise ValueError()
+        payload["action"].encode()
+        body["id"].encode()
+        body["model"].encode()
+    except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError, RecursionError):
+        raise ValueError("Vultr inference failed or returned an invalid proposal") from None
+    return payload, {
+        "provider": "Vultr Serverless Inference",
+        "completion_id": body["id"],
+        "model": body["model"],
+    }

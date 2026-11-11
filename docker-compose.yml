@@ -1,13 +1,26 @@
 services:
   gate:
     build: .
-    container_name: veylix-gate
-    ports:
-      - "8000:8000"
     environment:
-      - VULTR_INFERENCE_API_KEY=${VULTR_INFERENCE_API_KEY:-}
-      - VULTR_INFERENCE_MODEL=${VULTR_INFERENCE_MODEL:-llama-3.3-70b-instruct}
-      - VULTR_INFERENCE_BASE_URL=${VULTR_INFERENCE_BASE_URL:-https://api.vultrinference.com/v1}
-    volumes:
-      - ./data:/app/data
+      GATE_PROXY_TOKEN: ${GATE_PROXY_TOKEN:?Set a demo gateway token}
+      GATE_DEMO_ACCESS_CODE: ${GATE_DEMO_ACCESS_CODE:?Set a demo access code}
+      GATE_ALLOWED_ORIGINS: ${GATE_ALLOWED_ORIGINS:?Set the approved HTTPS Vercel origin}
+      VULTR_INFERENCE_API_KEY: ${VULTR_INFERENCE_API_KEY:-}
+      VULTR_INFERENCE_MODEL: ${VULTR_INFERENCE_MODEL:-}
+    read_only: true
     restart: unless-stopped
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      GATE_BACKEND_HOST: ${GATE_BACKEND_HOST:?Set the Vultr demo API hostname}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+volumes:
+  caddy_data:
+  caddy_config:
